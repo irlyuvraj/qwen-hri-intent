@@ -1,0 +1,20 @@
+# ═══════════════════════════════════════════════════════════════
+# Qwen3-Omni Streaming Intent Prediction — Python Dependencies
+# ═══════════════════════════════════════════════════════════════
+#
+# Install:  pip install -r requirements.txt
+#
+# Tested with Python 3.10–3.12
+
+# ── Core ──
+numpy>=1.24.0
+Pillow>=9.0.0
+openai>=1.0.0            # OpenAI-compatible client for vLLM
+httpx>=0.24.0             # HTTP connection pooling (used by OpenAI)
+soundfile>=0.12.0         # Audio I/O fallback
+
+# ── Video (required for --video mode) ──
+opencv-python>=4.7.0      # cv2 — frame reading, resize, composite labelling
+
+# ── Optional: live capture ──
+# pyaudio>=0.2.11         # Microphone capture (not needed for file-based prediction)

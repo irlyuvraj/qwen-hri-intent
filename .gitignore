@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+
+# Large video files (use Git LFS or download separately)
+video data/
+sample_data/*.mp4
+
+# Results (regenerated)
+results/*.jsonl
+results/*.html
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,388 @@
+{
+  "video_metadata": {
+    "filename": "cleaning.mp4",
+    "duration_seconds": 35.73,
+    "frame_rate": 30,
+    "total_frames": 1072,
+    "resolution": "640x480",
+    "has_audio": false,
+    "description": "Two robotic arms (left and right) performing a table-cleaning task — picking up and relocating household objects (sunglasses, cardboard box/tray, tissue, eraser/sponge) onto a green plate and clearing the table surface"
+  },
+
+  "scene_setup": {
+    "actors": [
+      {
+        "id": "left_hand",
+        "type": "robot_gripper",
+        "position": "left side of frame",
+        "description": "Robotic arm with black gripper fingers; primarily picks up and deposits objects onto the green plate"
+      },
+      {
+        "id": "right_hand",
+        "type": "robot_gripper",
+        "position": "right side of frame",
+        "description": "Robotic arm with black gripper fingers; handles objects on the right side of the table and cooperates with left hand on larger items"
+      }
+    ],
+    "objects": [
+      {"name": "green_plate", "color": "green", "initial_position": "left side", "description": "Round green plate used as a collection target for cleaned objects"},
+      {"name": "blue_plate", "color": "blue", "initial_position": "left side (visible early frames only)", "description": "Round blue plate, visible in early frames, removed or relocated early"},
+      {"name": "tissue_paper", "color": "white", "initial_position": "center-left", "description": "Crumpled white tissue/paper, placed on green plate during cleaning"},
+      {"name": "cardboard_tray", "color": "grey/beige", "initial_position": "center", "description": "Flat open cardboard box/tray, manipulated and relocated by both hands"},
+      {"name": "sunglasses", "color": "black", "initial_position": "center", "description": "Black sunglasses, picked up and moved during cleaning"},
+      {"name": "tissue_box", "color": "purple/white", "initial_position": "center-back", "description": "Rectangular tissue box, remains on table as background object throughout"},
+      {"name": "black_cup", "color": "black", "initial_position": "right-back", "description": "Tall dark cylindrical cup/container, remains on table throughout"},
+      {"name": "eraser_sponge", "color": "grey", "initial_position": "center (appears ~t=25s)", "description": "Small rectangular grey eraser or sponge, appears after other items are cleared"}
+    ]
+  },
+
+  "annotations": [
+    {
+      "event_id": 1,
+      "start_time": 0.0,
+      "end_time": 4.0,
+      "start_frame": 0,
+      "end_frame": 120,
+      "primary_actor": "left_hand",
+      "intent": "continue",
+      "confidence": "high",
+      "description": "Left hand is stationary at left edge of table holding or hovering near blue plate area. Right hand is also at rest on right side. Both arms in idle/standby posture before task begins.",
+      "visual_cues": [
+        "Both hands visible at frame edges",
+        "Minimal arm movement",
+        "Objects scattered on table surface untouched"
+      ],
+      "expected_prediction": "continue",
+      "notes": "Initial idle state; no active manipulation"
+    },
+
+    {
+      "event_id": 2,
+      "start_time": 0.0,
+      "end_time": 4.0,
+      "start_frame": 0,
+      "end_frame": 120,
+      "primary_actor": "right_hand",
+      "intent": "continue",
+      "confidence": "high",
+      "description": "Right hand is stationary at the right side of the frame in an open/idle posture.",
+      "visual_cues": [
+        "Gripper open",
+        "No movement toward objects",
+        "Observing/standby posture"
+      ],
+      "expected_prediction": "continue",
+      "notes": "Both hands idle at task start"
+    },
+
+    {
+      "event_id": 3,
+      "start_time": 4.0,
+      "end_time": 8.0,
+      "start_frame": 120,
+      "end_frame": 240,
+      "primary_actor": "right_hand",
+      "intent": "approach",
+      "confidence": "high",
+      "description": "Right hand moves inward toward the center of the table, approaching the sunglasses and cardboard tray area.",
+      "visual_cues": [
+        "Arm extending toward table center",
+        "Gripper orienting toward objects",
+        "Closing distance to sunglasses/tray"
+      ],
+      "expected_prediction": "approach",
+      "notes": "First active motion in the sequence; right hand begins task"
+    },
+
+    {
+      "event_id": 4,
+      "start_time": 4.0,
+      "end_time": 8.0,
+      "start_frame": 120,
+      "end_frame": 240,
+      "primary_actor": "left_hand",
+      "intent": "approach",
+      "confidence": "medium",
+      "description": "Left hand begins moving away from the blue plate and toward the tissue/crumpled paper on the table.",
+      "visual_cues": [
+        "Left arm moving right toward tissue",
+        "Blue plate no longer held",
+        "Gripper orienting downward"
+      ],
+      "expected_prediction": "approach",
+      "notes": "Left hand starts its own approach simultaneously with right hand"
+    },
+
+    {
+      "event_id": 5,
+      "start_time": 8.0,
+      "end_time": 13.0,
+      "start_frame": 240,
+      "end_frame": 390,
+      "primary_actor": "right_hand",
+      "intent": "gesture",
+      "confidence": "high",
+      "description": "Right hand grasps and picks up the sunglasses, actively manipulating and lifting them from the table surface.",
+      "visual_cues": [
+        "Gripper closing around sunglasses",
+        "Sunglasses lifted off table",
+        "Active object manipulation"
+      ],
+      "expected_prediction": "gesture",
+      "notes": "Clear grasp-and-lift action of sunglasses"
+    },
+
+    {
+      "event_id": 6,
+      "start_time": 8.0,
+      "end_time": 13.0,
+      "start_frame": 240,
+      "end_frame": 390,
+      "primary_actor": "left_hand",
+      "intent": "gesture",
+      "confidence": "high",
+      "description": "Left hand grasps the crumpled tissue paper and picks it up, beginning to move it toward the green plate.",
+      "visual_cues": [
+        "Gripper closing on tissue",
+        "Tissue lifted from table",
+        "Motion toward green plate"
+      ],
+      "expected_prediction": "gesture",
+      "notes": "Left hand manipulating tissue paper"
+    },
+
+    {
+      "event_id": 7,
+      "start_time": 13.0,
+      "end_time": 17.0,
+      "start_frame": 390,
+      "end_frame": 510,
+      "primary_actor": "left_hand",
+      "intent": "gesture",
+      "confidence": "high",
+      "description": "Left hand deposits tissue onto the green plate and then approaches and grasps the cardboard tray, beginning cooperative manipulation.",
+      "visual_cues": [
+        "Tissue placed on green plate",
+        "Gripper re-opening and moving to cardboard tray",
+        "Both hands converging on tray"
+      ],
+      "expected_prediction": "gesture",
+      "notes": "Deposit-and-regrasp action; transitions into bimanual tray manipulation"
+    },
+
+    {
+      "event_id": 8,
+      "start_time": 13.0,
+      "end_time": 20.0,
+      "start_frame": 390,
+      "end_frame": 600,
+      "primary_actor": "right_hand",
+      "intent": "gesture",
+      "confidence": "high",
+      "description": "Right hand cooperates with left hand to grasp opposite ends of the cardboard tray and move it together.",
+      "visual_cues": [
+        "Both grippers holding tray from opposite sides",
+        "Coordinated bimanual lift",
+        "Tray being relocated across table"
+      ],
+      "expected_prediction": "gesture",
+      "notes": "Bimanual cooperative manipulation of large flat object"
+    },
+
+    {
+      "event_id": 9,
+      "start_time": 20.0,
+      "end_time": 24.0,
+      "start_frame": 600,
+      "end_frame": 720,
+      "primary_actor": "right_hand",
+      "intent": "withdraw",
+      "confidence": "high",
+      "description": "Right hand releases the cardboard tray and withdraws to the right side of the frame after placing it.",
+      "visual_cues": [
+        "Gripper opening and releasing tray",
+        "Arm moving backward/right",
+        "Increasing distance from tray"
+      ],
+      "expected_prediction": "withdraw",
+      "notes": "Post-placement withdrawal of right arm"
+    },
+
+    {
+      "event_id": 10,
+      "start_time": 20.0,
+      "end_time": 25.0,
+      "start_frame": 600,
+      "end_frame": 750,
+      "primary_actor": "left_hand",
+      "intent": "withdraw",
+      "confidence": "medium",
+      "description": "Left hand also releases the tray and briefly withdraws before approaching the next object.",
+      "visual_cues": [
+        "Left arm pulling back",
+        "Gripper opening",
+        "Brief pause before next action"
+      ],
+      "expected_prediction": "withdraw",
+      "notes": "Short withdrawal phase before transitioning to next pick"
+    },
+
+    {
+      "event_id": 11,
+      "start_time": 24.0,
+      "end_time": 29.0,
+      "start_frame": 720,
+      "end_frame": 870,
+      "primary_actor": "left_hand",
+      "intent": "approach",
+      "confidence": "high",
+      "description": "Left hand approaches the small grey eraser/sponge that has appeared in the center of the table after previous objects were cleared.",
+      "visual_cues": [
+        "Arm moving toward center table",
+        "Gripper orienting downward toward eraser",
+        "Deliberate approach motion"
+      ],
+      "expected_prediction": "approach",
+      "notes": "New object appears after clearing; left hand begins next pick sequence"
+    },
+
+    {
+      "event_id": 12,
+      "start_time": 24.0,
+      "end_time": 30.0,
+      "start_frame": 720,
+      "end_frame": 900,
+      "primary_actor": "right_hand",
+      "intent": "continue",
+      "confidence": "high",
+      "description": "Right hand remains in a resting position on the right side while left hand handles the remaining object.",
+      "visual_cues": [
+        "Minimal right arm movement",
+        "Gripper at rest",
+        "Observing posture"
+      ],
+      "expected_prediction": "continue",
+      "notes": "Right hand idle during left hand's final pick"
+    },
+
+    {
+      "event_id": 13,
+      "start_time": 29.0,
+      "end_time": 35.73,
+      "start_frame": 870,
+      "end_frame": 1072,
+      "primary_actor": "left_hand",
+      "intent": "gesture",
+      "confidence": "high",
+      "description": "Left hand grasps the eraser/sponge and places it onto or near the green plate, completing the table cleaning task.",
+      "visual_cues": [
+        "Gripper closing on grey object",
+        "Object lifted and carried toward plate",
+        "Final placement action"
+      ],
+      "expected_prediction": "gesture",
+      "notes": "Final manipulation action; table clearing task completed"
+    },
+
+    {
+      "event_id": 14,
+      "start_time": 30.0,
+      "end_time": 35.73,
+      "start_frame": 900,
+      "end_frame": 1072,
+      "primary_actor": "right_hand",
+      "intent": "continue",
+      "confidence": "high",
+      "description": "Right hand returns to idle/rest position as the task concludes.",
+      "visual_cues": [
+        "Right arm at rest position",
+        "Gripper open",
+        "Table mostly clear except tissue box and cup"
+      ],
+      "expected_prediction": "continue",
+      "notes": "Task end state; both hands returning to idle"
+    }
+  ],
+
+  "temporal_summary": [
+    {
+      "time_range": "0-4s",
+      "dominant_intent": "continue",
+      "description": "Both hands idle; initial standby before cleaning task begins"
+    },
+    {
+      "time_range": "4-8s",
+      "dominant_intent": "approach",
+      "description": "Both hands simultaneously approach their respective target objects (sunglasses / tissue)"
+    },
+    {
+      "time_range": "8-13s",
+      "dominant_intent": "gesture",
+      "description": "Right hand grasps sunglasses; left hand grasps tissue paper and moves it to green plate"
+    },
+    {
+      "time_range": "13-20s",
+      "dominant_intent": "gesture",
+      "description": "Bimanual cooperative manipulation — both hands grasp and relocate the cardboard tray together"
+    },
+    {
+      "time_range": "20-25s",
+      "dominant_intent": "withdraw",
+      "description": "Both hands release tray and withdraw; brief transition/rest phase"
+    },
+    {
+      "time_range": "25-29s",
+      "dominant_intent": "approach",
+      "description": "Left hand approaches grey eraser/sponge; right hand remains idle"
+    },
+    {
+      "time_range": "29-35s",
+      "dominant_intent": "gesture",
+      "description": "Left hand grasps and places final object; task complete, arms return to idle"
+    }
+  ],
+
+  "evaluation_metrics_targets": {
+    "detection_rate": {
+      "continue": "Should detect 3 continue episodes (events 1, 2, 12, 14)",
+      "approach": "Should detect 3 approach episodes (events 3, 4, 11)",
+      "gesture": "Should detect 5 gesture episodes (events 5, 6, 7, 8, 13)",
+      "withdraw": "Should detect 2 withdraw episodes (events 9, 10)"
+    },
+    "advance_time_expectations": {
+      "description": "With 2-second prediction horizon, system should predict intents 1-2 seconds before they fully manifest",
+      "approach": "Should predict at t=2-6s for events 3-4, t=22-27s for event 11",
+      "gesture": "Should predict at t=6-11s for events 5-6, t=11-17s for events 7-8, t=27-32s for event 13",
+      "withdraw": "Should predict at t=18-22s for events 9-10"
+    },
+    "challenging_aspects": [
+      "No audio — system must rely entirely on visual cues",
+      "Two actors (hands) — simultaneous actions require per-actor tracking",
+      "Bimanual cooperation — events 7-8 involve both hands on the same object requiring coordination detection",
+      "Object variety — multiple different everyday objects with varied shapes and sizes",
+      "Object occlusion — arms and grippers frequently occlude table objects during manipulation",
+      "Blue plate disappears — early scene change may confuse object tracking models",
+      "New object appearance — eraser/sponge appears mid-video after table is partially cleared"
+    ]
+  },
+
+  "recommended_system_configuration": {
+    "prediction_interval": 2.0,
+    "workers": 1,
+    "fast_mode": true,
+    "notes": [
+      "Video has no audio track, so audio-based intents will not be detected",
+      "System should focus on arm trajectory and gripper aperture for intent classification",
+      "Bimanual events should be tracked per-actor independently",
+      "Prediction interval of 2s aligns well with action durations in this video",
+      "Fast mode recommended for efficiency in this controlled-environment scenario"
+    ]
+  },
+
+  "usage_notes": {
+    "preparation": "Run: python prepare_video.py cleaning.mp4 test_data/cleaning/",
+    "testing": "Run: python file_based_predictor.py --frames-dir test_data/cleaning/frames/ --audio-file test_data/cleaning/audio.wav --output results/cleaning_predictions.jsonl",
+    "evaluation": "Run: python evaluation.py --log-file results/cleaning_predictions.jsonl --ground-truth test_data/cleaning/ground_truth.json",
+    "expected_results": "Detection rate >70% for gesture/approach, advance time 1-2 seconds, latency <800ms"
+  }
+}
