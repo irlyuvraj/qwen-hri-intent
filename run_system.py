@@ -51,9 +51,9 @@ log = logging.getLogger("run_system")
 # ═══════════════════════════════════════════════════════════════
 
 POLICY_REGISTRY = {
-    "pick_pink_ball":   "tysyuvraj/so101-act-pick-pink-ball",
-    "pick_yellow_ball": "tysyuvraj/so101-act-pick-yellow-ball",
-    "pick_and_correct": "tysyuvraj/so101-act-pick-and-correct",
+    "pick_pink_ball":   "/home/so-101/.cache/huggingface/hub/models--tysyuvraj--so101-act-pick-pink-ball/snapshots/6583da19bf1296089fa71765f59fe52b230fbc24/checkpoints/100000/pretrained_model",
+    "pick_yellow_ball": "/home/so-101/.cache/huggingface/hub/models--tysyuvraj--so101-act-pick-yellow-ball/snapshots/0f105b326d61a9ba798cfa262086fa5bf945f2c5/checkpoints/100000/pretrained_model",
+    "pick_and_correct": "/home/so-101/.cache/huggingface/hub/models--tysyuvraj--so101-act-pick-and-correct/snapshots/b6a6d6fb1d913050bf0964389b98e8e4b0a62a76/checkpoints/100000/pretrained_model",
 }
 
 POLICY_KEYWORDS = {
