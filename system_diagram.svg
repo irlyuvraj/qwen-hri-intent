@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 660" width="1280" height="660">
+<defs>
+  <marker id="ah-blue"   markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#2563EB"/></marker>
+  <marker id="ah-slate"  markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#475569"/></marker>
+  <marker id="ah-muted"  markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#94A3B8"/></marker>
+  <marker id="ah-amber"  markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#D97706"/></marker>
+  <marker id="ah-green"  markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#16A34A"/></marker>
+  <marker id="ah-purple" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#9333EA"/></marker>
+</defs>
+
+<!-- Background -->
+<rect width="1280" height="660" fill="#F1F5F9"/>
+
+<!-- Title -->
+<text x="640" y="32" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="18" font-weight="bold" fill="#0F172A">Intent-Aware Robot Control — Qwen3-Omni + GR00T N1.6 on SO-101</text>
+
+<!-- ── Section backgrounds ── -->
+<!-- MacBook -->
+<rect x="183" y="50" width="650" height="555" rx="14" fill="#EFF6FF" stroke="#93C5FD" stroke-width="2" stroke-dasharray="7,4"/>
+<text x="508" y="70" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="12" font-weight="bold" fill="#1D4ED8">MacBook  (Robot Host)</text>
+
+<!-- s99 server -->
+<rect x="850" y="50" width="408" height="445" rx="14" fill="#FFFBEB" stroke="#FCD34D" stroke-width="2" stroke-dasharray="7,4"/>
+<text x="1054" y="70" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="12" font-weight="bold" fill="#92400E">s99 GPU Server — 192.168.2.25</text>
+
+<!-- ── Sensor boxes (left of MacBook) ── -->
+<!-- Camera -->
+<rect x="22" y="88" width="148" height="74" rx="8" fill="#DBEAFE" stroke="#2563EB" stroke-width="1.5"/>
+<text x="96" y="109" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="11" font-weight="bold" fill="#1E3A8A">Camera</text>
+<text x="96" y="125" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#1E40AF">index 0 · 640x480 native</text>
+<text x="96" y="140" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#1E40AF">crop 640x360 for GR00T</text>
+<text x="96" y="155" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#1E40AF">shared by Qwen + GR00T</text>
+
+<!-- Microphone -->
+<rect x="22" y="178" width="148" height="72" rx="8" fill="#DBEAFE" stroke="#2563EB" stroke-width="1.5"/>
+<text x="96" y="197" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="11" font-weight="bold" fill="#1E3A8A">Microphone</text>
+<text x="96" y="213" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#1E40AF">16 kHz · sounddevice</text>
+<text x="96" y="228" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#1E40AF">200 Hz HPF during exec</text>
+<text x="96" y="243" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#1E40AF">2.0 s rolling buffer</text>
+
+<!-- ── MacBook processing components ── -->
+<!-- StreamingIntentPredictor -->
+<rect x="198" y="83" width="218" height="120" rx="8" fill="white" stroke="#475569" stroke-width="1.5"/>
+<text x="307" y="103" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="11" font-weight="bold" fill="#1E293B">StreamingIntentPredictor</text>
+<text x="307" y="119" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">0.5 s interval · 1 worker</text>
+<text x="307" y="134" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">optical flow gate (theta=1.5)</text>
+<text x="307" y="149" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">video + audio frames → Qwen</text>
+<text x="307" y="164" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">auto-retry video-only if empty</text>
+<text x="307" y="179" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">JPEG q65 · 320x240 / frame</text>
+<text x="307" y="196" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">PredictionOutput → PolicyRouter</text>
+
+<!-- AudioInterruptDetector (dashed — default mode only) -->
+<rect x="198" y="220" width="218" height="68" rx="8" fill="white" stroke="#94A3B8" stroke-width="1.5" stroke-dasharray="5,3"/>
+<text x="307" y="240" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="10.5" font-weight="bold" fill="#475569">AudioInterruptDetector</text>
+<text x="307" y="256" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#64748B">energy VAD — default mode only</text>
+<text x="307" y="271" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#64748B">speech_end → Qwen.transcribe_audio</text>
+<text x="307" y="283" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9" fill="#94A3B8">(skipped with --no-vad flag)</text>
+
+<!-- PolicyRouter -->
+<rect x="447" y="83" width="228" height="145" rx="8" fill="white" stroke="#475569" stroke-width="1.5"/>
+<text x="561" y="103" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="11" font-weight="bold" fill="#1E293B">PolicyRouter</text>
+<text x="561" y="119" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">interrupt intent → STOP (streak≥2, conf≥0.85)</text>
+<text x="561" y="134" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">change_target → SWITCH policy</text>
+<text x="561" y="149" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">task_complete → STOP (runtime≥15 s)</text>
+<text x="561" y="164" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">40 s safety cap</text>
+<text x="561" y="179" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">3 s post-stop cooldown</text>
+<text x="561" y="194" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">spoken_command resume path</text>
+<text x="561" y="209" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">--no-vad cold-start streak (≥2 @ conf≥0.85)</text>
+<text x="561" y="221" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">TaskRegistry (tasks.yaml) · keyword resolve</text>
+
+<!-- InterruptDetectionSystem (dashed — legacy) -->
+<rect x="447" y="245" width="228" height="60" rx="8" fill="white" stroke="#94A3B8" stroke-width="1.5" stroke-dasharray="5,3"/>
+<text x="561" y="264" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="10.5" font-weight="bold" fill="#475569">InterruptDetectionSystem</text>
+<text x="561" y="280" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#64748B">MismatchDetector · consec=3 · grace=4 s</text>
+<text x="561" y="296" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9" fill="#94A3B8">(suppressed 3 s after multimodal stop)</text>
+
+<!-- GrootRobotController -->
+<rect x="325" y="380" width="228" height="100" rx="8" fill="white" stroke="#475569" stroke-width="1.5"/>
+<text x="439" y="400" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="11" font-weight="bold" fill="#1E293B">GrootRobotController</text>
+<text x="439" y="416" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">30 Hz control loop (background thread)</text>
+<text x="439" y="431" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">get_action: ThreadPool · 5 s timeout</text>
+<text x="439" y="446" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">start_policy / switch_policy / stop()</text>
+<text x="439" y="461" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">EMA Hz property</text>
+<text x="439" y="474" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">1.7–2.0 Hz end-to-end</text>
+
+<!-- ── s99 components ── -->
+<!-- Qwen3-Omni -->
+<rect x="862" y="83" width="382" height="118" rx="8" fill="#FEF3C7" stroke="#D97706" stroke-width="2"/>
+<text x="1053" y="104" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="12" font-weight="bold" fill="#78350F">Qwen3-Omni-30B-A3B-Instruct</text>
+<text x="1053" y="121" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#92400E">vLLM · port 8000 · CUDA:0 · temp=0.1 · max_tokens=80</text>
+<text x="1053" y="136" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#92400E">3 prompts: WAITING · EXECUTING · VIDEO-ONLY</text>
+<text x="1053" y="151" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#92400E">outputs: predicted_intent · confidence · target_object</text>
+<text x="1053" y="166" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#92400E">task_complete · reason · spoken_command</text>
+<text x="1053" y="181" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#92400E">unified multimodal fusion (audio + video, one call) · ~360 ms avg</text>
+<text x="1053" y="195" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#92400E">replaces: Whisper + VAP + visual intent encoder + fusion net</text>
+
+<!-- GR00T N1.6 -->
+<rect x="862" y="330" width="382" height="110" rx="8" fill="#DCFCE7" stroke="#16A34A" stroke-width="2"/>
+<text x="1053" y="351" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="12" font-weight="bold" fill="#14532D">GR00T N1.6 Policy Server</text>
+<text x="1053" y="368" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#166534">ZMQ · port 5555 · CUDA:1 · checkpoint-20000</text>
+<text x="1053" y="383" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#166534">input: 640x360 RGB frames + task language string</text>
+<text x="1053" y="398" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#166534">output: 8-step joint position action horizon</text>
+<text x="1053" y="413" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#166534">inference ~200–300 ms · motion ~290 ms / horizon</text>
+<text x="1053" y="428" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#166534">no internal done signal — stopped externally by PolicyRouter</text>
+
+<!-- SO-101 -->
+<rect x="862" y="490" width="382" height="92" rx="8" fill="#F3E8FF" stroke="#9333EA" stroke-width="2"/>
+<text x="1053" y="511" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="12" font-weight="bold" fill="#581C87">SO-101 Follower Arm</text>
+<text x="1053" y="528" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#6B21A8">USB serial · /dev/tty.usbmodem5AE70452961</text>
+<text x="1053" y="543" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#6B21A8">6-DOF · gripper · pink and yellow cotton ball workspace</text>
+<text x="1053" y="558" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#6B21A8">camera index 0 · 640x480 (shared camera feed)</text>
+<text x="1053" y="573" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#6B21A8">calibration: ~/.cache/huggingface/lerobot/</text>
+
+<!-- ── Arrows ── -->
+
+<!-- Camera → StreamingIntentPredictor (frames) -->
+<line x1="170" y1="125" x2="196" y2="125" stroke="#2563EB" stroke-width="1.5" marker-end="url(#ah-blue)"/>
+<text x="183" y="119" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9" fill="#2563EB">frames</text>
+
+<!-- Mic → StreamingIntentPredictor (audio) -->
+<line x1="170" y1="214" x2="196" y2="163" stroke="#2563EB" stroke-width="1.5" marker-end="url(#ah-blue)"/>
+<text x="179" y="196" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9" fill="#2563EB">audio</text>
+
+<!-- StreamingIntentPredictor → PolicyRouter (PredictionOutput) -->
+<line x1="416" y1="143" x2="445" y2="155" stroke="#475569" stroke-width="1.5" marker-end="url(#ah-slate)"/>
+<text x="430" y="141" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9" fill="#475569">PredictionOutput</text>
+
+<!-- AudioInterruptDetector → PolicyRouter (voice command, dashed) -->
+<line x1="416" y1="254" x2="445" y2="210" stroke="#94A3B8" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ah-muted)"/>
+<text x="435" y="239" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9" fill="#94A3B8">voice cmd</text>
+
+<!-- InterruptDetectionSystem → PolicyRouter (object_mismatch, dashed) -->
+<line x1="561" y1="245" x2="561" y2="230" stroke="#94A3B8" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ah-muted)"/>
+
+<!-- PolicyRouter → GrootRobotController (start/stop/switch) -->
+<line x1="538" y1="228" x2="473" y2="378" stroke="#475569" stroke-width="2" marker-end="url(#ah-slate)"/>
+<text x="519" y="306" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9" fill="#475569">start / stop / switch</text>
+
+<!-- StreamingIntentPredictor → Qwen (video+audio, HTTP) -->
+<path d="M 416 130 Q 635 95 860 130" fill="none" stroke="#D97706" stroke-width="2" marker-end="url(#ah-amber)"/>
+<text x="638" y="96" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#D97706">video frames + audio  (HTTP REST / vLLM)</text>
+
+<!-- Qwen → StreamingIntentPredictor (JSON result, dashed return) -->
+<path d="M 860 160 Q 635 138 416 155" fill="none" stroke="#D97706" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#ah-amber)"/>
+<text x="638" y="152" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#D97706">JSON: intent · confidence · reason · task_complete</text>
+
+<!-- GrootRobotController → GR00T (obs frames + task lang) -->
+<path d="M 553 415 Q 700 368 860 385" fill="none" stroke="#16A34A" stroke-width="2" marker-end="url(#ah-green)"/>
+<text x="710" y="362" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#16A34A">obs frames + task language  (ZMQ)</text>
+
+<!-- GR00T → GrootRobotController (joint actions, dashed return) -->
+<path d="M 860 422 Q 700 450 553 440" fill="none" stroke="#16A34A" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#ah-green)"/>
+<text x="710" y="453" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#16A34A">joint actions  (8-step horizon)</text>
+
+<!-- GrootRobotController → SO-101 (USB serial) -->
+<path d="M 553 462 Q 700 490 860 516" fill="none" stroke="#9333EA" stroke-width="2" marker-end="url(#ah-purple)"/>
+<text x="710" y="488" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#9333EA">joint commands  (USB serial)</text>
+
+<!-- SO-101 camera loop back to Camera (bottom arc) -->
+<path d="M 1053 582 Q 1053 635 620 635 Q 30 635 30 162" fill="none" stroke="#2563EB" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#ah-blue)"/>
+<text x="540" y="630" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9" fill="#2563EB">shared USB camera feed</text>
+
+<!-- ── Legend ── -->
+<rect x="198" y="510" width="300" height="90" rx="6" fill="white" stroke="#CBD5E1" stroke-width="1"/>
+<text x="348" y="528" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="10" font-weight="bold" fill="#1E293B">Legend</text>
+
+<line x1="212" y1="541" x2="252" y2="541" stroke="#475569" stroke-width="1.5" marker-end="url(#ah-slate)"/>
+<text x="262" y="545" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">Primary data flow</text>
+
+<line x1="212" y1="557" x2="252" y2="557" stroke="#94A3B8" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ah-muted)"/>
+<text x="262" y="561" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#94A3B8">Secondary / conditional flow</text>
+
+<rect x="212" y="568" width="11" height="11" rx="2" fill="#DBEAFE" stroke="#2563EB" stroke-width="1"/>
+<text x="230" y="578" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#2563EB">Sensor input</text>
+
+<rect x="212" y="583" width="11" height="11" rx="2" fill="white" stroke="#475569" stroke-width="1.5"/>
+<text x="230" y="593" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#475569">MacBook processing module</text>
+
+<rect x="342" y="568" width="11" height="11" rx="2" fill="#FEF3C7" stroke="#D97706" stroke-width="1.5"/>
+<text x="360" y="578" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#D97706">Remote model (s99)</text>
+
+<rect x="342" y="583" width="11" height="11" rx="2" fill="#F3E8FF" stroke="#9333EA" stroke-width="1.5"/>
+<text x="360" y="593" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#9333EA">Physical robot</text>
+
+</svg>
