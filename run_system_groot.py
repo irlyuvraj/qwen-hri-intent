@@ -916,10 +916,9 @@ def run(args):
             def audio_callback(indata, frames, time_info, status):
                 audio = indata[:, 0].copy()
                 # Send HPF-filtered audio to Qwen during execution to suppress
-                # motor-noise rumble below 200Hz while keeping speech intact.
-                # This lets Qwen detect stop/switch via interrupt/change_target
-                # without encoder degeneration from raw motor noise.
-                # Idle state gets clean unfiltered audio (no motor noise).
+                # motor-noise rumble below 400Hz while keeping speech intact.
+                # RMS is also capped to prevent loud bursts from causing encoder
+                # overload. Idle state gets clean unfiltered audio (no motor noise).
                 if robot.state == "idle":
                     predictor.add_audio(audio)
                 else:

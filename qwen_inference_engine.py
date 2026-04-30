@@ -802,10 +802,14 @@ If no specific object is targeted, use "none".
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             result_text = self._stream_until_json(stream)
+            parsed = self._parse_prediction(result_text)
 
-            # Retry without audio if Qwen returned empty (audio interference)
-            if not result_text.strip() and audio_b64:
-                logger.warning("Multi-frame: empty response with audio — retrying video-only")
+            # Retry video-only when response is empty OR parse failed (garbage JSON).
+            # Both indicate audio encoder degeneration from motor noise.
+            # Must use _FAST_PROMPT_VIDEO_ONLY — the EXECUTING prompt says "You receive
+            # BOTH video AND audio", causing Qwen to return empty when audio is absent.
+            if audio_b64 and (not result_text.strip() or parsed.get('_parse_failed')):
+                logger.warning("Multi-frame: degenerate response with audio — retrying video-only")
                 content_retry: list = [
                     {"type": "text", "text": prompt},
                     {"type": "image_url",
@@ -814,7 +818,7 @@ If no specific object is targeted, use "none".
                 stream_retry = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
-                        {"role": "system", "content": self.system_prompt},
+                        {"role": "system", "content": self._FAST_PROMPT_VIDEO_ONLY},
                         {"role": "user", "content": content_retry},
                     ],
                     temperature=self.temperature,
@@ -824,8 +828,8 @@ If no specific object is targeted, use "none".
                     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
                 result_text = self._stream_until_json(stream_retry)
+                parsed = self._parse_prediction(result_text)
 
-            parsed = self._parse_prediction(result_text)
             parsed['raw_response'] = result_text
             return parsed
         except Exception as e:
@@ -991,7 +995,8 @@ If no specific object is targeted, use "none".
             'predicted_intent': 'unknown',
             'confidence': 0.0,
             'target_object': 'none',
-            'reason': f'Parse error: no valid prediction in response'
+            'reason': 'Parse error: no valid prediction in response',
+            '_parse_failed': True,
         }
     
     def predict_intent_batch(
@@ -1246,36 +1251,43 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
             max_height=max_h,
         )
 
-    # High-pass filter coefficients (Butterworth order 4, cutoff 200 Hz @ 16 kHz).
-    # Computed once via scipy.signal.butter and cached as a class attribute so
-    # we don't import scipy on the hot path. Recompute by running:
-    #   from scipy.signal import butter
-    #   butter(4, 200/(16000/2), btype='highpass')
-    _HPF_B = np.array([
-        0.90244446, -3.60977783,  5.41466674, -3.60977783,  0.90244446])
-    _HPF_A = np.array([
-        1.0,        -3.7947911,   5.40516686, -3.42474735,  0.814406  ])
+    # High-pass filter coefficients (Butterworth order 4, cutoff 400 Hz @ 16 kHz).
+    # Raised from 200→400 Hz: motor harmonics extend past 200 Hz; 400 Hz removes
+    # more rumble while keeping speech intelligibility (formants start above 300 Hz).
+    # Computed dynamically so the cutoff is easy to change; falls back to hardcoded
+    # 200 Hz coefficients if scipy is unavailable (should never happen).
+    try:
+        from scipy.signal import butter as _scipy_butter
+        _HPF_B, _HPF_A = _scipy_butter(4, 400.0 / 8000.0, btype='highpass')
+        del _scipy_butter
+    except ImportError:
+        _HPF_B = np.array([
+            0.90244446, -3.60977783,  5.41466674, -3.60977783,  0.90244446])
+        _HPF_A = np.array([
+            1.0,        -3.7947911,   5.40516686, -3.42474735,  0.814406  ])
+
+    # RMS amplitude cap applied after HPF. Prevents loud motor-noise bursts
+    # (which survive the frequency filter as harmonics) from causing encoder
+    # overload in Qwen3-Omni. Only scales DOWN — never amplifies quiet audio.
+    _HPF_RMS_CAP: float = 0.04
 
     def _highpass_filter(self, audio: np.ndarray) -> np.ndarray:
-        """Apply a 200 Hz Butterworth high-pass to suppress GR00T motor rumble
-        below the speech band. Zero-phase via lfilter forward-then-reverse
-        (cheap filtfilt). Operates in float32; caller converts back to int16.
-
-        Why: vLLM + Qwen3-Omni enters a degenerate generation state (echoes
-        the user prompt, emits chat-template tokens) when fed audio buffers
-        dominated by low-frequency motor noise during execution. Filtering
-        below 200 Hz preserves speech intelligibility while removing the
-        trigger.
+        """Apply a 400 Hz Butterworth high-pass to suppress GR00T motor rumble.
+        Zero-phase via lfilter forward-then-reverse (cheap filtfilt).
+        Also caps RMS amplitude so loud motor-noise bursts don't overload
+        Qwen3-Omni's audio encoder. Only scales down, never amplifies.
         """
-        if audio.size < 30:  # too short to filter sensibly
+        if audio.size < 30:
             return audio
         x = audio.astype(np.float32)
         if audio.dtype == np.int16:
             x = x / 32768.0
-        # Forward-then-reverse for zero phase distortion (cheap filtfilt).
         from scipy.signal import lfilter
         y = lfilter(self._HPF_B, self._HPF_A, x)
         y = lfilter(self._HPF_B, self._HPF_A, y[::-1])[::-1]
+        rms = float(np.sqrt(np.mean(y ** 2)))
+        if rms > self._HPF_RMS_CAP:
+            y = y * (self._HPF_RMS_CAP / rms)
         return y.astype(np.float32)
 
     def encode_audio_to_base64(
