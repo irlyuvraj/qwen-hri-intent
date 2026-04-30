@@ -1,0 +1,19 @@
+# Task registry for GR00T N1.7 2-task pickplace checkpoint
+# (~/groot_finetune/pickplace-2task-n17/checkpoint-200000).
+#
+# Only pink_bowl + yellow_bowl — the give/table/correct tasks from the
+# 5-task checkpoint are NOT in this model; do not add them here or routing
+# will send the arm to a task the policy was never trained on.
+#
+# `lang` strings match the training data exactly — do not paraphrase.
+
+tasks:
+  - name: pick_pink_bowl
+    lang: "Pick the pink cotton ball and place it into the wooden bowl."
+    object: "pink cotton ball"
+    keywords: ["pink", "pink ball", "pink cotton", "pink one"]
+
+  - name: pick_yellow_bowl
+    lang: "Pick the yellow cotton ball and place it into the wooden bowl."
+    object: "yellow cotton ball"
+    keywords: ["yellow", "yellow ball", "yellow cotton", "yellow one"]

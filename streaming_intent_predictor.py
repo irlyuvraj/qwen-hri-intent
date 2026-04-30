@@ -96,6 +96,8 @@ class PredictionOutput:
     reason: str = ""
     latency_ms: float = 0.0
     raw_response: str = ""
+    task_complete: bool = False  # Qwen visual scene completion signal
+    spoken_command: str = ""     # verbatim command Qwen heard in audio (replaces VAD path)
 
 
 class RingBuffer:
@@ -386,12 +388,14 @@ class StreamingInferenceScheduler:
         while self.is_running:
             current_time = time.time()
 
+            effective_interval = self.config.inference_interval
+
             if current_time >= next_inference_time:
                 # --- backpressure: skip if workers are already saturated ---
                 if self.inference_queue.qsize() >= len(self.inference_workers):
                     # Don't increment counter, don't enqueue.
                     # Reset timer to NOW so we don't pile up catch-up ticks.
-                    next_inference_time = current_time + self.config.inference_interval
+                    next_inference_time = current_time + effective_interval
                     time.sleep(0.01)
                     continue
 
@@ -406,7 +410,7 @@ class StreamingInferenceScheduler:
                 if video_frame is not None:
                     # Optical flow gate — skip if arms are idle
                     if not self._has_motion(video_frame):
-                        next_inference_time = current_time + self.config.inference_interval
+                        next_inference_time = current_time + effective_interval
                         time.sleep(0.01)
                         continue
 
@@ -426,7 +430,7 @@ class StreamingInferenceScheduler:
                         pass
 
                     # Only advance the timer when we actually enqueued.
-                    next_inference_time = current_time + self.config.inference_interval
+                    next_inference_time = current_time + effective_interval
                 # else: video not ready yet — don't advance timer, retry in 10 ms
 
             time.sleep(0.01)
@@ -495,6 +499,13 @@ class StreamingInferenceScheduler:
                 audio_energy = np.abs(input_data.audio_window).max()
                 if audio_energy < 1e-6:
                     use_video_only = True
+                # During execution, audio is high-pass filtered (200 Hz cutoff)
+                # before being added to the buffer — motor-noise rumble is
+                # suppressed while the speech band (300Hz+) is preserved.
+                # Use the full multimodal path so Qwen can detect stop/switch
+                # commands via predicted_intent=interrupt/change_target.
+                # Video-only is only forced when audio energy is essentially
+                # zero (silence gate above) or audio is absent entirely.
 
             # Prefer multi-frame methods when we have multiple frames
             frames = input_data.video_frames  # List or None
@@ -541,7 +552,9 @@ class StreamingInferenceScheduler:
                 confidence=result.get('confidence', 0.0),
                 target_object=result.get('target_object', 'none'),
                 reason=result.get('reason', ''),
-                raw_response=result.get('raw_response', '')
+                raw_response=result.get('raw_response', ''),
+                task_complete=bool(result.get('task_complete', False)),
+                spoken_command=str(result.get('spoken_command', '') or '').strip(),
             )
             
         except Exception as e:

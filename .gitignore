@@ -21,3 +21,17 @@ results/*.html
 # OS
 .DS_Store
 Thumbs.db
+
+# Backups and scratch files
+*.bak
+*.bak2
+bk.*.py
+backup*/
+backup */
+
+# Generated / runtime data
+logs/
+sessions/
+camera_snaps/
+predictions.jsonl
+demo.mp4

@@ -50,16 +50,10 @@ log = logging.getLogger("run_system")
 # Policy Registry
 # ═══════════════════════════════════════════════════════════════
 
-# Single π0 LoRA checkpoint — path as seen by the policy_server (s99)
-PI0_CHECKPOINT_REMOTE = "/home/yuvraj/pi0_lora_40k"
-PI0_POLICY_TYPE = "pi0"
-
-# Task strings MUST match the training dataset exactly — π0 is prompt-sensitive.
-# Source: /home/yuvraj/so101_training/data/so101_combined/meta/tasks.parquet
-POLICY_TASKS = {
-    "pick_pink_ball":   "Pick up the pink cotton ball and place it on the plate",
-    "pick_yellow_ball": "Pick up the yellow cotton ball and place it on the plate",
-    "pick_and_correct": "Pick up the cotton ball and place it on the plate. Stop, not this one.",
+POLICY_REGISTRY = {
+    "pick_pink_ball":   "/home/so-101/.cache/huggingface/hub/models--tysyuvraj--so101-act-pick-pink-ball/snapshots/6583da19bf1296089fa71765f59fe52b230fbc24/checkpoints/100000/pretrained_model",
+    "pick_yellow_ball": "/home/so-101/.cache/huggingface/hub/models--tysyuvraj--so101-act-pick-yellow-ball/snapshots/0f105b326d61a9ba798cfa262086fa5bf945f2c5/checkpoints/100000/pretrained_model",
+    "pick_and_correct": "/home/so-101/.cache/huggingface/hub/models--tysyuvraj--so101-act-pick-and-correct/snapshots/b6a6d6fb1d913050bf0964389b98e8e4b0a62a76/checkpoints/100000/pretrained_model",
 }
 
 POLICY_KEYWORDS = {
@@ -76,7 +70,7 @@ POLICY_TO_OBJECT = {
 
 
 def resolve_policy(text: str) -> Optional[str]:
-    """Map a voice command or object name to a policy name."""
+    """Map a voice command or object name to an ACT policy name."""
     text_lower = text.lower().strip()
     for policy, keywords in POLICY_KEYWORDS.items():
         for kw in keywords:
@@ -90,29 +84,12 @@ def resolve_policy(text: str) -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════
 
 class RobotController:
-    """
-    Manages LeRobot robot_client as a subprocess.
+    """Manages LeRobot policy_server + robot_client as subprocesses."""
 
-    The policy_server runs REMOTELY on s99 and is launched manually (see README).
-    This controller only starts/stops/restarts the local robot_client with
-    different --task strings to switch behaviors on the single π0 LoRA policy.
-    """
-
-    def __init__(
-        self,
-        robot_port: str,
-        robot_camera_index: int,
-        server_address: str,
-        checkpoint_path: str = PI0_CHECKPOINT_REMOTE,
-        policy_type: str = PI0_POLICY_TYPE,
-        policy_device: str = "cuda",
-    ):
+    def __init__(self, robot_port: str, robot_camera_index: int):
         self.robot_port = robot_port
         self.robot_camera_index = robot_camera_index
-        self.server_address = server_address
-        self.checkpoint_path = checkpoint_path
-        self.policy_type = policy_type
-        self.policy_device = policy_device
+        self._server_proc = None
         self._client_proc = None
         self._active_policy = None
         self._state = "idle"  # idle | starting | running | stopping
@@ -127,46 +104,79 @@ class RobotController:
         return self._active_policy
 
     def start_policy(self, policy_name: str) -> dict:
-        """Start executing a policy by launching robot_client with the matching task string."""
+        """Start executing a policy on the robot."""
         with self._lock:
-            if policy_name not in POLICY_TASKS:
+            if policy_name not in POLICY_REGISTRY:
                 return {"ok": False, "error": f"Unknown policy: {policy_name}",
-                        "available": list(POLICY_TASKS.keys())}
+                        "available": list(POLICY_REGISTRY.keys())}
 
             if self._state == "running":
                 return {"ok": False, "error": "Already running. Call stop() or switch() first."}
 
             self._state = "starting"
-            task_string = POLICY_TASKS[policy_name]
+            policy_path = POLICY_REGISTRY[policy_name]
 
+            # Start LeRobot policy server
+            server_cmd = [
+                sys.executable, "-m", "lerobot.async_inference.policy_server",
+                f"--policy_type=act",
+                f"--pretrained_name_or_path={policy_path}",
+                f"--policy_device=cuda",
+                f"--port=8080",
+            ]
+            log.info("Starting policy server: %s", policy_name)
+            self._server_proc = subprocess.Popen(
+                server_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+
+            # Wait for server to be ready (poll up to 15s)
+            ready = False
+            for _ in range(30):
+                if self._server_proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.3)
+                    s.connect(("127.0.0.1", 8080))
+                    s.close()
+                    ready = True
+                    break
+                except (ConnectionRefusedError, OSError):
+                    continue
+
+            if not ready and self._server_proc.poll() is not None:
+                stderr = self._server_proc.stderr.read().decode()
+                self._state = "idle"
+                return {"ok": False, "error": f"Server failed to start: {stderr[:500]}"}
+
+            # Start robot client
             client_cmd = [
                 sys.executable, "-m", "lerobot.async_inference.robot_client",
-                f"--server_address={self.server_address}",
+                f"--server_address=127.0.0.1:8080",
                 f"--robot.type=so101_follower",
                 f"--robot.port={self.robot_port}",
                 f"--robot.id=my_awesome_follower_arm",
                 f'--robot.cameras={{ front: {{type: opencv, index_or_path: '
-                f'{self.robot_camera_index}, width: 640, height: 480, fps: 30}}}}',
-                f"--policy_type={self.policy_type}",
-                f"--pretrained_name_or_path={self.checkpoint_path}",
-                f"--policy_device={self.policy_device}",
-                f"--task={task_string}",
+                f'{self.robot_camera_index}, width: 640, height: 360, fps: 60}}}}',
+                f"--policy_type=act",
+                f"--pretrained_name_or_path={policy_path}",
+                f"--policy_device=cuda",
                 f"--actions_per_chunk=50",
                 f"--chunk_size_threshold=0.5",
                 f"--aggregate_fn_name=weighted_average",
             ]
-            log.info("Starting robot client: %s", policy_name)
-            log.info("  task=%r", task_string)
-            # Inherit stdout/stderr so robot_client logs stream to this terminal
-            self._client_proc = subprocess.Popen(client_cmd)
+            log.info("Starting robot client")
+            self._client_proc = subprocess.Popen(
+                client_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
 
-            # π0 is heavy — give the server more time to load/warm up on first launch
-            time.sleep(3)
+            time.sleep(2)
             if self._client_proc.poll() is not None:
+                stderr = self._client_proc.stderr.read().decode()
+                self._kill_server()
                 self._state = "idle"
-                return {"ok": False,
-                        "error": f"Client exited with code {self._client_proc.returncode} "
-                                 "(see stderr above)"}
+                return {"ok": False, "error": f"Client failed to start: {stderr[:500]}"}
 
             self._active_policy = policy_name
             self._state = "running"
@@ -174,13 +184,14 @@ class RobotController:
             return {"ok": True, "policy": policy_name, "state": "running"}
 
     def stop(self) -> dict:
-        """Stop current policy execution (kills the robot_client subprocess)."""
+        """Stop current policy execution."""
         with self._lock:
             if self._state != "running":
                 return {"ok": True, "state": self._state, "msg": "Nothing to stop"}
 
             self._state = "stopping"
             self._kill_client()
+            self._kill_server()
             prev = self._active_policy
             self._active_policy = None
             self._state = "idle"
@@ -188,8 +199,8 @@ class RobotController:
             return {"ok": True, "stopped": prev, "state": "idle"}
 
     def switch_policy(self, policy_name: str) -> dict:
-        """Stop current policy and start a new one with a different task string."""
-        if policy_name not in POLICY_TASKS:
+        """Stop current policy and start a new one."""
+        if policy_name not in POLICY_REGISTRY:
             return {"ok": False, "error": f"Unknown policy: {policy_name}"}
 
         stop_result = self.stop()
@@ -212,21 +223,17 @@ class RobotController:
                 self._client_proc.kill()
             self._client_proc = None
 
+    def _kill_server(self):
+        if self._server_proc and self._server_proc.poll() is None:
+            self._server_proc.send_signal(signal.SIGINT)
+            try:
+                self._server_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._server_proc.kill()
+            self._server_proc = None
+
     def shutdown(self):
         self.stop()
-
-
-def _check_policy_server_reachable(server_address: str, timeout: float = 2.0) -> bool:
-    """Quick TCP probe to verify the remote policy_server is up."""
-    try:
-        host, port = server_address.split(":")
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((host, int(port)))
-        s.close()
-        return True
-    except Exception:
-        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -335,29 +342,10 @@ class PolicyRouter:
 def run(args):
     """Main loop: camera + mic + Qwen + policy routing + robot control."""
 
-    # ── Policy server reachability probe ──
-    if not _check_policy_server_reachable(args.policy_server_address):
-        log.error("Policy server at %s is not reachable.", args.policy_server_address)
-        log.error("Launch it on s99 first:")
-        log.error("  ssh yuvraj@192.168.2.25 'source ~/miniconda3/etc/profile.d/conda.sh && \\")
-        log.error("    conda activate base && \\")
-        log.error("    python -m lerobot.async_inference.policy_server \\")
-        log.error("      --host=0.0.0.0 --port=8080 --fps=30'")
-        sys.exit(1)
-    log.info("Policy server reachable: %s", args.policy_server_address)
-
     # ── Robot controller ──
-    robot = RobotController(
-        args.robot_port,
-        args.robot_camera_index,
-        args.policy_server_address,
-        checkpoint_path=args.checkpoint_path,
-        policy_type=PI0_POLICY_TYPE,
-        policy_device=args.policy_device,
-    )
-    log.info("Robot controller ready (port=%s, camera=%d, server=%s, ckpt=%s)",
-             args.robot_port, args.robot_camera_index,
-             args.policy_server_address, args.checkpoint_path)
+    robot = RobotController(args.robot_port, args.robot_camera_index)
+    log.info("Robot controller ready (port=%s, camera=%d)",
+             args.robot_port, args.robot_camera_index)
 
     # ── Qwen inference engine ──
     engine = FastQwenInferenceEngine(
@@ -489,8 +477,19 @@ def run(args):
                     "reason": pred.reason,
                 }
 
-                # Visual predictions are used for interrupt detection only.
-                # Robot starts exclusively from verbal commands (via on_new_task callback).
+                # Waiting for initial voice command
+                if robot.state in ("idle", "stopping") and pred.predicted_intent in (
+                    "new_command", "approach", "gesture"
+                ):
+                    if pred.target_object and pred.target_object != "none":
+                        policy = resolve_policy(pred.target_object)
+                        if policy:
+                            log.info("Voice command: '%s' -> %s",
+                                     pred.target_object, policy)
+                            router.handle_voice_command(
+                                f"pick up the {pred.target_object}"
+                            )
+
                 router.handle_prediction(pred_dict)
 
             time.sleep(0.05)
@@ -513,22 +512,16 @@ def main():
     )
     parser.add_argument("--vllm-url", default="http://192.168.2.25:8000/v1",
                         help="vLLM server URL on s99")
-    parser.add_argument("--robot-port", default="/dev/tty.usbmodem5AE70452961",
-                        help="Robot follower arm serial port (macOS)")
+    parser.add_argument("--robot-port", default="/dev/ttyACM1",
+                        help="Robot serial port")
     parser.add_argument("--camera-index", type=int, default=0,
                         help="Camera index for Qwen observation")
-    parser.add_argument("--robot-camera-index", type=int, default=0,
+    parser.add_argument("--robot-camera-index", type=int, default=8,
                         help="Camera index for robot policy (LeRobot)")
     parser.add_argument("--mic-index", type=int, default=None,
                         help="Microphone device index")
     parser.add_argument("--no-audio", action="store_true",
                         help="Disable microphone (video-only)")
-    parser.add_argument("--policy-server-address", default="192.168.2.25:8080",
-                        help="LeRobot policy_server address (host:port) on s99")
-    parser.add_argument("--checkpoint-path", default=PI0_CHECKPOINT_REMOTE,
-                        help="π0 LoRA checkpoint path (as seen by policy_server on s99)")
-    parser.add_argument("--policy-device", default="cuda",
-                        help="Device for policy inference on the remote server")
 
     args = parser.parse_args()
     run(args)

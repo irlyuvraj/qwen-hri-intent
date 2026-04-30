@@ -1,0 +1,34 @@
+# Task registry for GR00T N1.7 multitask checkpoint.
+# `lang` strings match the training data exactly — do not paraphrase; the policy
+# was fine-tuned on these specific phrasings and drifts if you change wording.
+#
+# Keyword ordering matters: the FIRST entry whose keyword appears in a voice
+# command wins. More specific tasks (bowl / give / table) are listed before
+# the generic colour fallbacks so "give me the pink one" routes to pick_pink_give
+# rather than pick_pink_bowl.
+
+tasks:
+  - name: pick_pink_give
+    lang: "Pick the pink cotton ball and give it to me."
+    object: "pink cotton ball"
+    keywords: ["give", "give me", "give it", "hand me", "hand it"]
+
+  - name: pick_pink_table
+    lang: "Put this pink cotton ball on the table."
+    object: "pink cotton ball"
+    keywords: ["table", "on the table", "on table"]
+
+  - name: pick_pink_bowl
+    lang: "Pick the pink cotton ball and place it into the wooden bowl."
+    object: "pink cotton ball"
+    keywords: ["pink", "pink ball", "pink cotton", "pink one"]
+
+  - name: pick_yellow_bowl
+    lang: "Pick the yellow cotton ball and place it into the wooden bowl."
+    object: "yellow cotton ball"
+    keywords: ["yellow", "yellow ball", "yellow cotton", "yellow one"]
+
+  - name: pick_and_correct
+    lang: "Pick the cotton ball and place it into the wooden bowl. Stop, not this one."
+    object: "cotton ball"
+    keywords: [other, correct, different, "not this"]

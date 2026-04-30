@@ -1,0 +1,23 @@
+# Task registry — defines policies the robot can execute and how voice commands map to them.
+# Used by run_system_groot.py.
+#
+# Each entry:
+#   name      — internal policy id (string, no spaces). Logs reference this.
+#   lang      — exact natural-language instruction sent to GR00T per observation.
+#               For best results, this should match training-data wording.
+#   object    — short human-readable target object (used for visual mismatch checks
+#               and as the active-task hint injected into Qwen's prompt).
+#   keywords  — list of substrings; if any appears in a transcribed voice command,
+#               this task is selected. Lowercase, kept short. Order doesn't matter,
+#               but the FIRST registry entry whose keyword matches wins.
+
+tasks:
+  - name: pick_pink_ball
+    lang: "Pick up the pink cotton ball and place it in the bowl"
+    object: "pink cotton ball"
+    keywords: [pink, "pink ball", "pink cotton", "pink one"]
+
+  - name: pick_yellow_ball
+    lang: "Pick up the yellow cotton ball and place it in the bowl"
+    object: "yellow cotton ball"
+    keywords: [yellow, "yellow ball", "yellow cotton", "yellow one"]

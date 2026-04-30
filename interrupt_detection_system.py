@@ -116,6 +116,36 @@ class InterruptEvent:
 STOP_KEYWORDS    = {'stop', 'no', 'wait', 'halt', 'cancel', 'abort'}
 REDIRECT_KEYWORDS = {'other', 'different', 'instead', 'not that', 'wrong',
                      'not this', 'another', 'change'}
+# Keywords that resume the most recently paused task
+CONTINUE_KEYWORDS = {'continue', 'resume', 'go', 'go ahead', 'proceed',
+                     'keep going', 'carry on'}
+
+# Single-word transcripts we accept (verbal stop / barge-in / resume tokens)
+_ALLOWED_SINGLE_WORDS = STOP_KEYWORDS | CONTINUE_KEYWORDS | {'pause'}
+
+
+def _is_valid_command_transcript(text: str) -> bool:
+    """
+    Filter junk transcripts produced by Qwen on noise / partial utterances.
+    Drops:
+      - Non-ASCII-dominant strings (Qwen sometimes hallucinates Chinese on noise, e.g. '我。')
+      - Single-word fragments that aren't a recognized stop/control word (e.g. 'Pick', 'Continue')
+    """
+    if not text or not text.strip():
+        return False
+    cleaned = text.strip()
+
+    # ASCII fraction — drop transcripts dominated by non-Latin characters
+    ascii_chars = sum(1 for c in cleaned if ord(c) < 128)
+    if ascii_chars / max(len(cleaned), 1) < 0.6:
+        return False
+
+    # Single-word fragments are usually mid-utterance bleed; only allow control words
+    words = [w for w in cleaned.lower().replace('.', ' ').replace(',', ' ').split() if w]
+    if len(words) <= 1:
+        return bool(words) and words[0] in _ALLOWED_SINGLE_WORDS
+
+    return True
 
 class AudioInterruptDetector:
     """
@@ -139,16 +169,24 @@ class AudioInterruptDetector:
 
     def __init__(
         self,
-        sample_rate:      int   = 16000,
-        energy_threshold: float = 0.02,   # RMS energy for VAD trigger
-        use_vap:          bool  = False,  # set True if VAP-Realtime installed
+        sample_rate:        int   = 16000,
+        energy_threshold:   float = 0.02,   # RMS energy for VAD trigger
+        use_vap:            bool  = False,  # set True if VAP-Realtime installed
+        silence_hangover_ms: int  = 150,    # require this much silence before declaring utterance ended
+        min_utterance_ms:   int   = 200,    # drop utterances shorter than this (likely noise / single phoneme)
+        max_utterance_ms:   int   = 8000,   # force-flush very long utterances (safety)
     ):
-        self.sample_rate      = sample_rate
-        self.energy_threshold = energy_threshold
-        self.use_vap          = use_vap
-        self._vap_model       = None
-        self._speech_active   = False
-        self._speech_buffer   = []   # accumulate audio while speech detected
+        self.sample_rate         = sample_rate
+        self.energy_threshold    = energy_threshold
+        self.use_vap             = use_vap
+        self.silence_hangover_ms = silence_hangover_ms
+        self.min_utterance_ms    = min_utterance_ms
+        self.max_utterance_ms    = max_utterance_ms
+        self._vap_model          = None
+        self._speech_active      = False
+        self._speech_buffer      = []   # accumulate audio while speech detected
+        self._silence_ms         = 0    # consecutive silence accumulated while in active utterance
+        self._utterance_ms       = 0    # total length of current utterance
         self._on_speech_end_callbacks: List[Callable] = []
 
         if use_vap:
@@ -181,39 +219,81 @@ class AudioInterruptDetector:
         return self._process_energy_vad(audio_chunk)
 
     def _process_energy_vad(self, audio_chunk: np.ndarray) -> bool:
+        chunk_ms = len(audio_chunk) / self.sample_rate * 1000
         rms = float(np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2)))
         is_speech = rms > self.energy_threshold
 
         if is_speech:
             if not self._speech_active:
-                logger.debug(f"Speech onset detected (RMS={rms:.3f})")
+                logger.debug(f"Speech onset (RMS={rms:.3f})")
+                self._utterance_ms = 0
             self._speech_active = True
+            self._silence_ms = 0
             self._speech_buffer.append(audio_chunk)
+            self._utterance_ms += chunk_ms
+
+            # Safety: cap runaway utterances
+            if self._utterance_ms >= self.max_utterance_ms:
+                self._flush_utterance(reason="max_duration")
+                return True
+
         elif self._speech_active:
-            # Speech just ended
-            self._speech_active = False
-            full_audio = np.concatenate(self._speech_buffer)
-            self._speech_buffer = []
-            for cb in self._on_speech_end_callbacks:
-                cb(full_audio)
+            # Inside an utterance but this chunk is silent — keep buffering through
+            # short pauses (between syllables / words), only flush after sustained silence.
+            self._speech_buffer.append(audio_chunk)
+            self._silence_ms += chunk_ms
+            self._utterance_ms += chunk_ms
+            if self._silence_ms >= self.silence_hangover_ms:
+                self._flush_utterance(reason="silence_hangover")
 
         return is_speech
 
+    def _flush_utterance(self, reason: str = ""):
+        """End-of-utterance: hand the accumulated buffer to callbacks, reset state."""
+        if not self._speech_buffer:
+            self._reset_utterance_state()
+            return
+        full_audio = np.concatenate(self._speech_buffer)
+        duration_ms = len(full_audio) / self.sample_rate * 1000
+        self._reset_utterance_state()
+
+        if duration_ms < self.min_utterance_ms:
+            logger.debug(f"Dropped short utterance ({duration_ms:.0f}ms < min "
+                         f"{self.min_utterance_ms}ms, reason={reason})")
+            return
+
+        for cb in self._on_speech_end_callbacks:
+            cb(full_audio)
+
+    def _reset_utterance_state(self):
+        self._speech_active = False
+        self._speech_buffer = []
+        self._silence_ms = 0
+        self._utterance_ms = 0
+
     def _process_vap(self, audio_chunk: np.ndarray) -> bool:
-        """VAP-based speech detection (higher quality)."""
+        """VAP-based speech detection (higher quality). Same hangover/min-duration rules."""
         try:
+            chunk_ms = len(audio_chunk) / self.sample_rate * 1000
             result = self._vap_model.process(audio_chunk)
             is_speech = result.get('p_now', 0) > 0.5
-            if is_speech and not self._speech_active:
-                logger.debug(f"VAP speech onset: p_now={result.get('p_now',0):.2f}")
-            self._speech_active = is_speech
+
             if is_speech:
+                if not self._speech_active:
+                    logger.debug(f"VAP speech onset: p_now={result.get('p_now',0):.2f}")
+                    self._utterance_ms = 0
+                self._speech_active = True
+                self._silence_ms = 0
                 self._speech_buffer.append(audio_chunk)
-            elif self._speech_buffer:
-                full_audio = np.concatenate(self._speech_buffer)
-                self._speech_buffer = []
-                for cb in self._on_speech_end_callbacks:
-                    cb(full_audio)
+                self._utterance_ms += chunk_ms
+                if self._utterance_ms >= self.max_utterance_ms:
+                    self._flush_utterance(reason="max_duration")
+            elif self._speech_active:
+                self._speech_buffer.append(audio_chunk)
+                self._silence_ms += chunk_ms
+                self._utterance_ms += chunk_ms
+                if self._silence_ms >= self.silence_hangover_ms:
+                    self._flush_utterance(reason="silence_hangover")
             return is_speech
         except Exception as e:
             logger.error(f"VAP error: {e}")
@@ -221,14 +301,17 @@ class AudioInterruptDetector:
 
     def parse_keyword(self, text: str) -> Optional[str]:
         """
-        Check if transcribed text contains stop/redirect keywords.
-        Returns 'stop', 'redirect', or None.
+        Check if transcribed text contains stop/redirect/continue keywords.
+        Returns 'stop', 'redirect', 'continue', or None.
+        Stop wins over continue when both appear ("stop, then continue" → stop).
         """
         text_lower = text.lower()
         if any(kw in text_lower for kw in STOP_KEYWORDS):
             return 'stop'
         if any(kw in text_lower for kw in REDIRECT_KEYWORDS):
             return 'redirect'
+        if any(kw in text_lower for kw in CONTINUE_KEYWORDS):
+            return 'continue'
         return None
 
 
@@ -363,6 +446,7 @@ class TaskMonitor:
 
     def __init__(self):
         self._active: Optional[ActiveTask] = None
+        self._paused: Optional[ActiveTask] = None
         self._lock = threading.Lock()
         self._history: List[ActiveTask] = []
 
@@ -391,6 +475,33 @@ class TaskMonitor:
     def get_active(self) -> Optional[ActiveTask]:
         with self._lock:
             return self._active
+
+    def pause_active(self) -> Optional[ActiveTask]:
+        """
+        Move the active task to the paused slot. Returns the paused task (or None).
+        Called on VERBAL_STOP so a later 'continue' can resume the same task.
+        """
+        with self._lock:
+            if self._active is None or self._active.completed:
+                return None
+            self._paused = self._active
+            self._active = None
+            logger.info(f"⏸️  Paused task: '{self._paused.command}'")
+            return self._paused
+
+    def take_paused(self) -> Optional[ActiveTask]:
+        """Pop the paused task (resume path). Returns it, or None if nothing paused."""
+        with self._lock:
+            t = self._paused
+            self._paused = None
+            return t
+
+    def clear_paused(self):
+        """Discard any paused task (called when human picks a different task instead)."""
+        with self._lock:
+            if self._paused is not None:
+                logger.info(f"🗑️  Discarded paused task: '{self._paused.command}'")
+                self._paused = None
 
     def parse_command(self, command: str) -> Dict[str, str]:
         """
@@ -542,6 +653,7 @@ class InterruptDetectionSystem:
         grace_period:         float = 4.0,
         audio_sample_rate:    int   = 16000,
         groot_api             = None,
+        verbal_stop_dedup_s:  float = 2.0,
     ):
         # Components
         self.task_monitor    = TaskMonitor()
@@ -554,6 +666,16 @@ class InterruptDetectionSystem:
             grace_period=grace_period,
         )
         self.command_interface = CommandInterface(groot_api=groot_api)
+
+        # Optional caller-supplied transcript validator. Returns True to keep,
+        # False to drop. Set this to a closure over your TaskRegistry so junk
+        # transcripts ("Thank you.", "Shh.") never reach the task monitor.
+        self.command_validator: Optional[Callable[[str], bool]] = None
+
+        # Verbal-stop dedup: suppress duplicate VERBAL_STOP within this window.
+        # Without this the same "stop" word can fire 2-3 interrupts back-to-back.
+        self._verbal_stop_dedup_s = verbal_stop_dedup_s
+        self._last_verbal_stop_time = 0.0
 
         # Patch set_task to reset the mismatch grace period timer on every new task
         # and inject active task object into the inference engine prompt.
@@ -633,8 +755,23 @@ class InterruptDetectionSystem:
             )
             self._fire_interrupt(event)
 
+        elif keyword_type == 'continue':
+            # Resume the most recently paused task, if any.
+            paused = self.task_monitor.take_paused()
+            if paused is None:
+                logger.info(f"'{command}' → no paused task to resume; ignoring")
+                return
+            logger.info(f"▶️  Resuming paused task: '{paused.command}'")
+            self.command_interface.send_new_task(paused.command)
+            self.task_monitor.set_task(
+                command=paused.command,
+                intent=paused.intent,
+                target_object=paused.target_object,
+            )
+
         elif keyword_type == 'redirect':
-            # Parse new task from the command
+            # Human chose a different task — drop any paused task first.
+            self.task_monitor.clear_paused()
             parsed = self.task_monitor.parse_command(command)
             new_task = f"pick up the {parsed['object']}" if parsed['object'] != 'unknown' else ""
             event = InterruptEvent(
@@ -647,8 +784,11 @@ class InterruptDetectionSystem:
             self._fire_interrupt(event)
 
         else:
-            # New task command (not an interrupt)
+            # New task command (not an interrupt) — notify the robot via command_interface.
+            # A new pick command supersedes any paused task.
+            self.task_monitor.clear_paused()
             parsed = self.task_monitor.parse_command(command)
+            self.command_interface.send_new_task(command)
             self.task_monitor.set_task(
                 command=command,
                 intent=parsed['intent'],
@@ -660,15 +800,54 @@ class InterruptDetectionSystem:
     def _on_speech_captured(self, audio: np.ndarray):
         """
         Called when a speech segment ends (from audio_detector).
-        In production: pipe this to Whisper or another ASR.
-        For now: logs the speech onset as a potential interrupt trigger.
+        Pipes audio to Qwen for transcription, then parses the command.
         """
         duration_ms = len(audio) / self.audio_detector.sample_rate * 1000
-        logger.info(f"Speech detected ({duration_ms:.0f}ms) — pipe to ASR for command parsing")
-        # TODO: pipe audio to Whisper → self.on_verbal_command(transcription)
+        logger.info(f"Speech detected ({duration_ms:.0f}ms) — transcribing via Qwen...")
+
+        engine = self._inference_engine
+        if engine is None or not hasattr(engine, 'transcribe_audio'):
+            logger.warning("No transcription engine available — speech ignored")
+            return
+
+        def _transcribe_and_dispatch():
+            try:
+                text = engine.transcribe_audio(
+                    audio, sample_rate=self.audio_detector.sample_rate
+                )
+                if not text:
+                    logger.debug("Transcription empty — no command")
+                    return
+                if not _is_valid_command_transcript(text):
+                    logger.info(f"Dropped junk transcript: '{text}'")
+                    return
+                # Control keywords (stop / continue / redirect) are not tasks —
+                # they must bypass the task-registry validator.
+                is_control = self.audio_detector.parse_keyword(text) is not None
+                if (not is_control) and self.command_validator and not self.command_validator(text):
+                    logger.info(f"Dropped non-actionable transcript: '{text}'")
+                    return
+                logger.info(f"Transcribed: '{text}'")
+                self.on_verbal_command(text)
+            except Exception as e:
+                logger.error(f"Transcription error: {e}")
+
+        # Run in background thread — audio callback must not block
+        threading.Thread(target=_transcribe_and_dispatch, daemon=True).start()
 
     def _fire_interrupt(self, event: InterruptEvent):
         """Fire an interrupt event — send stop, then new task if available."""
+        # Dedup repeated VERBAL_STOPs from the same word ("stop", "stop.").
+        if event.reason == InterruptReason.VERBAL_STOP:
+            now = time.time()
+            since = now - self._last_verbal_stop_time
+            if since < self._verbal_stop_dedup_s:
+                logger.info(
+                    f"Suppressed duplicate verbal stop ({since:.2f}s since last)"
+                )
+                return
+            self._last_verbal_stop_time = now
+
         self._interrupt_count += 1
         logger.warning(
             f"⚡ INTERRUPT #{self._interrupt_count}: {event.reason.value} "
@@ -678,10 +857,15 @@ class InterruptDetectionSystem:
         # 1. Stop immediately
         self.command_interface.send_stop(event.reason, event.confidence)
 
-        # 2. Send new task if we know what it is
+        # 2a. VERBAL_STOP with no redirect → stash the active task so 'continue' can resume it.
+        if event.reason == InterruptReason.VERBAL_STOP and not event.new_task:
+            self.task_monitor.pause_active()
+
+        # 2b. Send new task if we know what it is (CHANGE_TARGET / visual redirect).
         if event.new_task:
+            # Redirect supersedes any paused task — human picked something different.
+            self.task_monitor.clear_paused()
             self.command_interface.send_new_task(event.new_task)
-            # Update task monitor with redirected task
             parsed = self.task_monitor.parse_command(event.new_task)
             self.task_monitor.set_task(
                 command=event.new_task,

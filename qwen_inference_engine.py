@@ -76,6 +76,10 @@ class Qwen3OmniInferenceEngine:
         # can deprioritise non-target objects in its predictions.
         self.active_task_object: Optional[str] = None
 
+        # Full task instruction — injected so Qwen can signal task_complete
+        # when the scene shows the task is already finished.
+        self.active_task_lang: Optional[str] = None
+
         # State machine fields
         self._sm_state: Optional[str] = None      # current confirmed state
         self._sm_state_count: int = 0             # consecutive predictions in this state
@@ -110,6 +114,24 @@ class Qwen3OmniInferenceEngine:
         
         # System prompt — accept override or build default
         self.system_prompt = system_prompt or self._build_system_prompt()
+
+        # vLLM guided JSON schema. Grammar-constrains generation so the model
+        # CANNOT emit prose, thinking text, or chat-template fragments — only
+        # valid JSON conforming to this schema. Fixes the failure mode where
+        # Qwen3-30B-Omni dumps reasoning ("Additionally, the robot arm...")
+        # instead of structured output during execution.
+        self._guided_json_schema = {
+            "type": "object",
+            "properties": {
+                "predicted_intent": {"type": "string"},
+                "confidence":       {"type": "number", "minimum": 0, "maximum": 1},
+                "target_object":    {"type": "string"},
+                "task_complete":    {"type": "boolean"},
+                "reason":           {"type": "string", "maxLength": 200},
+            },
+            "required": ["predicted_intent", "confidence", "target_object", "reason"],
+            "additionalProperties": False,
+        }
     
     def _build_system_prompt(self) -> str:
         """Build system prompt for intent prediction task.
@@ -335,6 +357,12 @@ If no specific object is targeted, use "none".
         raw   = parsed.get('predicted_intent', 'unknown')
         state = self._sm_state
 
+        # Cold-start command intents bypass the visual motion state machine —
+        # they're discrete command events emitted by the WAITING prompt and
+        # should propagate untouched to PolicyRouter.
+        if isinstance(raw, str) and raw.startswith('command_'):
+            return parsed
+
         # ── State timeout: force reset if stuck too long ──────────────────
         if (self._sm_state_count >= self._SM_MAX_CONSECUTIVE
                 and state not in ('continue', 'unknown', None)):
@@ -401,6 +429,13 @@ If no specific object is targeted, use "none".
                 f"Robot is currently targeting: {self.active_task_object}. "
                 f"Always describe objects by color and type (e.g. 'blue bottle', 'brown flask'). "
                 f"Only report a different target if the hand is clearly moving toward it."
+            )
+        if self.active_task_lang:
+            parts.append(
+                f"Task being executed: \"{self.active_task_lang}\". "
+                f"Set task_complete:true if the TARGET OBJECT is already at its destination "
+                f"(e.g. ball is visibly inside the bowl/plate). "
+                f"Ignore the robot arm position — only check whether the object reached its goal."
             )
         if self.scene_objects:
             parts.append(f"Known objects in scene: {', '.join(self.scene_objects)}")
@@ -625,10 +660,14 @@ If no specific object is targeted, use "none".
                             stream.close()
                             return result_text
         stripped = result_text.strip()
+        # Demoted from warning → debug: these fire on every degenerate response
+        # during execution and flood the log. The audio-encoder degeneration
+        # is a known server-side issue; we just want the log to remain
+        # readable for actual events (cold-start, stop, switch, task_complete).
         if not stripped:
-            logger.warning("_stream_until_json: Qwen returned only whitespace/newlines — likely audio interference")
+            logger.debug("_stream_until_json: empty response (audio encoder degeneration)")
         elif '{' not in stripped:
-            logger.warning(f"_stream_until_json: no JSON in response: {stripped!r}")
+            logger.debug(f"_stream_until_json: no JSON: {stripped!r}")
         return result_text
 
     def _stitch_frames(self, frames: list) -> np.ndarray:
@@ -699,6 +738,7 @@ If no specific object is targeted, use "none".
         if self.client is None:
             return {'predicted_intent': 'unknown', 'confidence': 0.0,
                     'reason': 'Client not initialized', 'error': 'no client'}
+        self._select_system_prompt(robot_state)
         try:
             audio_b64 = self.encode_audio_to_base64(audio_window, sample_rate)
             composite = self._stitch_frames(video_frames)
@@ -709,14 +749,23 @@ If no specific object is targeted, use "none".
                         'reason': 'Failed to encode composite', 'error': 'encoding'}
 
             n = len(video_frames)
-            prompt = (
-                f"The image contains {n} consecutive frames stitched "
-                f"side-by-side (labeled oldest→newest, left to right).\n"
-                f"1. Compare hand/arm positions across panels to detect motion.\n"
-                f"2. If positions barely changed → predict 'continue'.\n"
-                f"3. If hand is touching/holding an object → predict 'gesture'.\n"
-            )
-            if self.active_task_object:
+            is_waiting = 'state=waiting' in (robot_state or '')
+            if is_waiting:
+                prompt = (
+                    f"The image contains {n} consecutive frames stitched "
+                    f"side-by-side (oldest→newest, left to right). The robot "
+                    f"is IDLE. Listen to the audio and classify per the "
+                    f"system prompt's enum.\n"
+                )
+            else:
+                prompt = (
+                    f"The image contains {n} consecutive frames stitched "
+                    f"side-by-side (labeled oldest→newest, left to right).\n"
+                    f"1. Compare hand/arm positions across panels to detect motion.\n"
+                    f"2. If positions barely changed → predict 'continue'.\n"
+                    f"3. If hand is touching/holding an object → predict 'gesture'.\n"
+                )
+            if self.active_task_object and not is_waiting:
                 prompt += (
                     f"Robot is currently targeting: {self.active_task_object}. "
                     f"Always describe objects by color and type (e.g. 'blue bottle', 'brown flask'). "
@@ -726,7 +775,8 @@ If no specific object is targeted, use "none".
                 prompt += f"Known objects: {', '.join(self.scene_objects)}\n"
             if robot_state:
                 prompt += f"Robot state: {robot_state}\n"
-            prompt += "Predict the agent's near-future intention and identify which object is targeted."
+            if not is_waiting:
+                prompt += "Predict the agent's near-future intention and identify which object is targeted."
 
             content: list = [
                 {"type": "text", "text": prompt},
@@ -798,6 +848,10 @@ If no specific object is targeted, use "none".
         if self.client is None:
             return {'predicted_intent': 'unknown', 'confidence': 0.0,
                     'reason': 'Client not initialized', 'error': 'no client'}
+        # Must use VIDEO-ONLY prompt here. _FAST_PROMPT_EXECUTING says
+        # "You receive BOTH video AND audio" — sending no audio with that
+        # prompt causes Qwen3-Omni to return empty content in ~88ms.
+        self.system_prompt = self._FAST_PROMPT_VIDEO_ONLY
         try:
             composite = self._stitch_frames(video_frames)
             frame_b64 = self.encode_image_to_base64(composite)
@@ -894,6 +948,7 @@ If no specific object is targeted, use "none".
                     parsed['target_object'] = 'none'
                 if 'reason' not in parsed:
                     parsed['reason'] = 'No reason provided'
+                parsed['task_complete'] = bool(parsed.get('task_complete', False))
 
                 return parsed
             else:
@@ -915,6 +970,9 @@ If no specific object is targeted, use "none".
         obj_match = re.search(
             r'"target_object"\s*:\s*"([^"]+)"', response
         )
+        tc_match = re.search(
+            r'"task_complete"\s*:\s*(true|false)', response, re.IGNORECASE
+        )
         reason_match = re.search(
             r'"reason"\s*:\s*"([^"]+)"', response
         )
@@ -925,6 +983,7 @@ If no specific object is targeted, use "none".
                 'predicted_intent': intent_match.group(1),
                 'confidence': conf,
                 'target_object': obj_match.group(1) if obj_match else 'none',
+                'task_complete': tc_match.group(1).lower() == 'true' if tc_match else False,
                 'reason': reason_match.group(1) if reason_match else 'Parsed via regex fallback',
             }
 
@@ -976,39 +1035,153 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
         'Camera watching a 6-DOF SO101 robot arm with gripper on a workspace.\n'
         'Objects on workspace: cotton balls (pink, yellow).\n'
         'Frames oldest→newest (composite panels left→right).\n'
-        'Compare GRIPPER position across panels to detect motion.\n'
-        'Predict the NEXT 2-second intent. Name the target object by color.\n'
-        'ALSO LISTEN for verbal commands in the audio.\n'
-        'DECISION RULE:\n'
-        '- Gripper at frame edge OR barely moved → "continue"\n'
-        '- Gripper moving TOWARD object, claws open → "approach"\n'
-        '- Gripper claws CLOSED ON object, arm moving/holding → "gesture"\n'
-        '- Gripper moving AWAY after releasing → "withdraw"\n'
-        '- Trajectory redirecting to different object → "change_target"\n'
-        '- Verbal "stop"/"no"/"wait" or sudden stop → "interrupt"\n'
-        '- Verbal command to pick a different object → "new_command"\n'
-        '- Unclear → "unknown"\n'
-        'Reply ONLY with JSON: '
-        '{"predicted_intent":"<class>","confidence":0.0-1.0,'
-        '"target_object":"<object description by color or none>",'
-        '"reason":"<20 words max describing motion or voice command>"}'
+        'You receive BOTH video AND audio. Audio may contain human voice commands.\n'
+        '\n'
+        'TWO JOBS — do both every call:\n'
+        '1. LISTEN: Transcribe any spoken words verbatim into spoken_command.\n'
+        '   spoken_command = "" if silent or only background/motor noise.\n'
+        '2. WATCH: Classify the arm motion into predicted_intent.\n'
+        '\n'
+        'STOP/INTERRUPT RULE (highest priority):\n'
+        'If you hear "stop", "halt", "wait", "cancel" — set\n'
+        'predicted_intent="interrupt" AND spoken_command=<the word heard>.\n'
+        '\n'
+        'SWITCH RULE:\n'
+        'If you hear a command to switch objects ("yellow one", "other ball", etc.)\n'
+        'set predicted_intent="change_target" AND spoken_command=<words heard>.\n'
+        '\n'
+        'predicted_intent values:\n'
+        '- "continue" — gripper barely moving\n'
+        '- "approach" — gripper moving toward object, claws open\n'
+        '- "gesture" — gripper closed on object, holding/moving it\n'
+        '- "withdraw" — gripper moving away after release\n'
+        '- "interrupt" — heard stop/halt OR arm froze mid-motion\n'
+        '- "change_target" — heard switch command OR trajectory redirecting\n'
+        '- "unknown" — unclear\n'
+        '\n'
+        'task_complete: true ONLY if target object is visibly at its destination '
+        '(ball in bowl/plate). Ignore arm position. Default false.\n'
+        '\n'
+        'EXAMPLE 1 — silence, arm grasping pink ball:\n'
+        '{"spoken_command":"","predicted_intent":"gesture","confidence":0.95,'
+        '"target_object":"pink cotton ball","task_complete":false,'
+        '"reason":"Gripper closed on pink ball, lifting it"}\n'
+        '\n'
+        'EXAMPLE 2 — human says "stop" while arm moves:\n'
+        '{"spoken_command":"stop","predicted_intent":"interrupt","confidence":0.95,'
+        '"target_object":"yellow cotton ball","task_complete":false,'
+        '"reason":"Verbal stop command heard, arm mid-motion"}\n'
+        '\n'
+        'EXAMPLE 3 — human says "pick up the yellow one" while arm holds pink:\n'
+        '{"spoken_command":"pick up the yellow one","predicted_intent":"change_target",'
+        '"confidence":0.9,"target_object":"yellow cotton ball","task_complete":false,'
+        '"reason":"Switch command heard, redirecting to yellow ball"}\n'
+        '\n'
+        'EXAMPLE 4 — silence, arm approaching pink ball:\n'
+        '{"spoken_command":"","predicted_intent":"approach","confidence":0.9,'
+        '"target_object":"pink cotton ball","task_complete":false,'
+        '"reason":"Gripper moving toward pink ball, claws open"}\n'
+        '\n'
+        'Reply ONLY with JSON in this exact field order: '
+        '{"spoken_command":"<verbatim words or empty>",'
+        '"predicted_intent":"<class>","confidence":0.0-1.0,'
+        '"target_object":"<object color or none>",'
+        '"task_complete":false,'
+        '"reason":"<15 words max>"}'
     )
 
-    _FAST_PROMPT_WAITING = (
-        'Camera watching a 6-DOF SO101 robot arm (idle) on a workspace.\n'
+
+    # Video-only system prompt — used by predict_intent_video_only_multi_frame.
+    # Must NOT mention audio; Qwen3-Omni returns empty when told "you receive
+    # BOTH video AND audio" but only an image is sent in the request.
+    _FAST_PROMPT_VIDEO_ONLY = (
+        'Camera watching a 6-DOF SO101 robot arm with gripper on a workspace.\n'
         'Objects on workspace: cotton balls (pink, yellow).\n'
-        'The robot is IDLE and waiting for a voice command.\n'
-        'LISTEN carefully for verbal commands in the audio.\n'
-        'If you hear a command like "pick up the [color] ball", report it.\n'
-        'DECISION RULE:\n'
-        '- No voice command heard → "continue"\n'
-        '- Voice command to pick an object → "new_command"\n'
-        '- Unclear speech → "unknown"\n'
+        'Frames oldest→newest (composite panels left→right). NO audio.\n'
+        '\n'
+        'predicted_intent values:\n'
+        '- "continue" — gripper barely moving\n'
+        '- "approach" — gripper moving toward object, claws open\n'
+        '- "gesture" — gripper closed on object, holding/moving it\n'
+        '- "withdraw" — gripper moving away after release\n'
+        '- "change_target" — trajectory redirecting to different object\n'
+        '- "interrupt" — sudden freeze mid-motion\n'
+        '- "unknown" — unclear\n'
+        '\n'
+        'task_complete: true ONLY if target object is visibly at its destination '
+        '(ball in bowl/plate). Default false.\n'
+        '\n'
+        'EXAMPLE 1:\n'
+        '{"spoken_command":"","predicted_intent":"approach","confidence":0.9,'
+        '"target_object":"pink cotton ball","task_complete":false,'
+        '"reason":"Gripper moving toward pink ball"}\n'
+        '\n'
+        'EXAMPLE 2:\n'
+        '{"spoken_command":"","predicted_intent":"gesture","confidence":0.95,'
+        '"target_object":"yellow cotton ball","task_complete":false,'
+        '"reason":"Gripper closed, holding yellow ball"}\n'
+        '\n'
         'Reply ONLY with JSON: '
-        '{"predicted_intent":"<class>","confidence":0.0-1.0,'
-        '"target_object":"<object mentioned in command or none>",'
-        '"reason":"<what you heard or saw>"}'
+        '{"spoken_command":"",'
+        '"predicted_intent":"<class>","confidence":0.0-1.0,'
+        '"target_object":"<object or none>",'
+        '"task_complete":false,'
+        '"reason":"<15 words max>"}'
     )
+
+    # WAITING prompt — Qwen-only cold-start experiment (April 25).
+    # Encodes cold-start commands AS predicted_intent enum values
+    # (command_pick_pink_ball / command_pick_yellow_ball / none) instead of
+    # asking Qwen to fill a free-form spoken_command field (which it ignores).
+    # This rides the same classification mechanism that already works for
+    # interrupt and change_target. Built dynamically from task list — see
+    # _build_waiting_prompt below.
+    _FAST_PROMPT_WAITING = ''  # populated dynamically per task registry
+
+    def _build_waiting_prompt(self) -> str:
+        choices = self._cold_start_choices or [
+            ('command_pick_pink_ball', 'pink cotton ball'),
+            ('command_pick_yellow_ball', 'yellow cotton ball'),
+        ]
+        bullets = '\n'.join(
+            f'  - "{intent}" — heard a verbal command to pick up the {obj}'
+            for intent, obj in choices
+        )
+        example_intent, example_obj = choices[0]
+        return (
+            'Camera watching a 6-DOF SO101 robot arm (idle) on a workspace.\n'
+            'The robot is IDLE waiting for a verbal task command from the human.\n'
+            'You receive BOTH video AND audio.\n'
+            '\n'
+            'YOUR JOB: classify whether the human just spoke a verbal command\n'
+            'to start a task. Output one of these values in predicted_intent:\n'
+            f'{bullets}\n'
+            '  - "none" — silence, background noise, or speech unrelated to a task\n'
+            '\n'
+            'CRITICAL RULES:\n'
+            '1. Only emit a command_* value if you HEARD a clear verbal command\n'
+            '   in the audio. Visible objects on the table do NOT count — silence\n'
+            '   with objects visible MUST be classified as "none".\n'
+            '2. If you hear unrelated speech (chatter, "hello", "thanks"), output "none".\n'
+            '3. Be conservative — when in doubt, output "none".\n'
+            '\n'
+            'EXAMPLE A — silence, both balls visible on workspace:\n'
+            '{"predicted_intent":"none","confidence":0.95,'
+            '"target_object":"none","reason":"Workspace silent, no verbal command"}\n'
+            '\n'
+            f'EXAMPLE B — human says "pick up the pink one":\n'
+            '{"predicted_intent":"command_pick_pink_ball","confidence":0.9,'
+            '"target_object":"pink cotton ball","reason":"Heard verbal command for pink ball"}\n'
+            '\n'
+            'EXAMPLE C — human says "hello there" (unrelated chatter):\n'
+            '{"predicted_intent":"none","confidence":0.9,'
+            '"target_object":"none","reason":"Unrelated speech, no task command"}\n'
+            '\n'
+            'Reply ONLY with JSON: '
+            '{"predicted_intent":"<value>","confidence":0.0-1.0,'
+            '"target_object":"<object color or none>",'
+            '"reason":"<short, 15 words max>"}'
+        )
 
     def __init__(
         self,
@@ -1017,7 +1190,12 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
         model_name: str = "qwen3-30b-a3b",
         system_prompt: Optional[str] = None,
         scene_objects: Optional[list] = None,
+        cold_start_choices: Optional[list] = None,
     ):
+        # cold_start_choices: list of (intent_value, object_description) tuples
+        # used to build the WAITING prompt's enum. Populated from TaskRegistry
+        # in run_system_groot.py main.
+        self._cold_start_choices = cold_start_choices
         super().__init__(
             vllm_url=vllm_url,
             api_key=api_key,
@@ -1038,8 +1216,11 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
         self.composite_max_width = 960   # 320px × 3 panels
         self.composite_max_height = 240
 
-        # Only send last 0.5 seconds of audio (reduces audio tokens)
-        self.audio_max_duration = 0.5
+        # Audio window length sent to Qwen on each prediction tick.
+        # Was 0.5s — too short for Qwen to recognise multi-word commands like
+        # "pick up the yellow cotton ball" (~1.7s). Bumped to 2.0s to match the
+        # streaming predictor's audio_buffer_duration so spoken_command can fire.
+        self.audio_max_duration = 2.0
 
         # Robot state for dynamic prompt switching
         self._current_robot_state = ''
@@ -1065,29 +1246,120 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
             max_height=max_h,
         )
 
+    # High-pass filter coefficients (Butterworth order 4, cutoff 200 Hz @ 16 kHz).
+    # Computed once via scipy.signal.butter and cached as a class attribute so
+    # we don't import scipy on the hot path. Recompute by running:
+    #   from scipy.signal import butter
+    #   butter(4, 200/(16000/2), btype='highpass')
+    _HPF_B = np.array([
+        0.90244446, -3.60977783,  5.41466674, -3.60977783,  0.90244446])
+    _HPF_A = np.array([
+        1.0,        -3.7947911,   5.40516686, -3.42474735,  0.814406  ])
+
+    def _highpass_filter(self, audio: np.ndarray) -> np.ndarray:
+        """Apply a 200 Hz Butterworth high-pass to suppress GR00T motor rumble
+        below the speech band. Zero-phase via lfilter forward-then-reverse
+        (cheap filtfilt). Operates in float32; caller converts back to int16.
+
+        Why: vLLM + Qwen3-Omni enters a degenerate generation state (echoes
+        the user prompt, emits chat-template tokens) when fed audio buffers
+        dominated by low-frequency motor noise during execution. Filtering
+        below 200 Hz preserves speech intelligibility while removing the
+        trigger.
+        """
+        if audio.size < 30:  # too short to filter sensibly
+            return audio
+        x = audio.astype(np.float32)
+        if audio.dtype == np.int16:
+            x = x / 32768.0
+        # Forward-then-reverse for zero phase distortion (cheap filtfilt).
+        from scipy.signal import lfilter
+        y = lfilter(self._HPF_B, self._HPF_A, x)
+        y = lfilter(self._HPF_B, self._HPF_A, y[::-1])[::-1]
+        return y.astype(np.float32)
+
     def encode_audio_to_base64(
         self,
         audio_window: np.ndarray,
         sample_rate: int = 16000,
         max_duration: Optional[float] = None,
     ) -> str:
-        """Override to cap audio at 1 second."""
+        """Override to cap audio duration. NOTE: high-pass filter was tested
+        (April 26) but removed — it didn't reduce prediction-path failures
+        and degraded transcribe_audio because speech fundamentals (85–250 Hz)
+        overlap the filter cutoff."""
         return super().encode_audio_to_base64(
             audio_window,
             sample_rate=sample_rate,
             max_duration=max_duration or self.audio_max_duration,
         )
 
-    def build_user_prompt(self, robot_state: Optional[str] = None) -> str:
-        """Override to store robot_state for dynamic system prompt switching."""
-        # Store robot_state so system_prompt property can read it
+    def _select_system_prompt(self, robot_state: Optional[str]) -> None:
+        """Switch self.system_prompt between WAITING and EXECUTING based on
+        robot_state. Must be called at the top of every predict_* method —
+        the multi-frame paths build their own user prompt and bypass
+        build_user_prompt, so without this call the WAITING prompt would
+        never be selected even when the robot is idle."""
         self._current_robot_state = robot_state or ''
-        # Dynamically update system prompt based on robot state
         if 'state=waiting' in self._current_robot_state:
-            self.system_prompt = self._FAST_PROMPT_WAITING
+            self.system_prompt = self._build_waiting_prompt()
         else:
             self.system_prompt = self._FAST_PROMPT_EXECUTING
+
+    def build_user_prompt(self, robot_state: Optional[str] = None) -> str:
+        """Override to store robot_state for dynamic system prompt switching."""
+        self._select_system_prompt(robot_state)
         return super().build_user_prompt(robot_state)
+
+    def transcribe_audio(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
+        """
+        Transcribe a speech segment using Qwen's audio capability.
+        Returns the transcribed text, or empty string on failure.
+        Used by the interrupt system to parse verbal stop/redirect commands.
+        """
+        if self.client is None:
+            return ""
+        try:
+            # Pad short utterances with leading silence so Qwen3-Omni's audio
+            # encoder has enough context. Without this, sub-500ms clips like a
+            # quick "stop" tend to come back as empty transcriptions.
+            min_samples = int(1.0 * sample_rate)
+            if len(audio) < min_samples:
+                pad = np.zeros(min_samples - len(audio), dtype=audio.dtype)
+                audio = np.concatenate([pad, audio])
+            audio_b64 = self.encode_audio_to_base64(
+                audio, sample_rate=sample_rate, max_duration=5.0
+            )
+            if not audio_b64:
+                return ""
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Transcribe the speech exactly as spoken. Reply with only the transcribed words, nothing else. If there is no speech, reply with an empty string.",
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Transcribe:"},
+                            {"type": "input_audio", "input_audio": {"data": audio_b64, "format": "wav"}},
+                        ],
+                    },
+                ],
+                temperature=0.0,
+                max_tokens=60,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            text = response.choices[0].message.content or ""
+            # Strip vLLM chat-template echo artifacts (e.g. "user\nStop", "assistant\nTranscribe:")
+            _noise = {'user', 'assistant', 'system', 'transcribe:', 'transcribe'}
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            lines = [l for l in lines if l.lower() not in _noise]
+            return ' '.join(lines).strip()
+        except Exception as e:
+            logger.warning(f"transcribe_audio failed: {e}")
+            return ""
 
 
 if __name__ == "__main__":
