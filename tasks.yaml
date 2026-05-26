@@ -10,6 +10,8 @@
 #   keywords  — list of substrings; if any appears in a transcribed voice command,
 #               this task is selected. Lowercase, kept short. Order doesn't matter,
 #               but the FIRST registry entry whose keyword matches wins.
+#   max_runtime_s (optional) — per-task safety cap before auto-stop. Overrides
+#               PolicyRouter's default (40s). Use a longer value for multi-step tasks.
 
 tasks:
   - name: pick_pink_ball

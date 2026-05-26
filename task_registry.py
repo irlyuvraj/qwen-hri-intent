@@ -18,6 +18,9 @@ class Task:
     lang: str
     object: str
     keywords: List[str]
+    # Optional per-task safety cap — overrides PolicyRouter's default
+    # max_task_runtime_s. Use a longer value for multi-step tasks (e.g. pour).
+    max_runtime_s: Optional[float] = None
 
 
 class TaskRegistry:
@@ -39,11 +42,13 @@ class TaskRegistry:
             for k in ("name", "lang", "object", "keywords"):
                 if k not in entry:
                     raise ValueError(f"{path}: tasks[{i}] missing '{k}'")
+            mr = entry.get("max_runtime_s")
             tasks.append(Task(
                 name=str(entry["name"]),
                 lang=str(entry["lang"]),
                 object=str(entry["object"]),
                 keywords=[str(kw).lower() for kw in entry["keywords"]],
+                max_runtime_s=float(mr) if mr is not None else None,
             ))
         return cls(tasks)
 

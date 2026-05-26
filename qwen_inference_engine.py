@@ -53,7 +53,7 @@ class Qwen3OmniInferenceEngine:
         model_name: str = "qwen3-30b-a3b",
         temperature: float = 0.3,
         top_p: float = 0.8,
-        max_tokens: int = 80,
+        max_tokens: int = 160,  # raised May 19 — see FastQwenInferenceEngine
         system_prompt: Optional[str] = None,
         scene_objects: Optional[list] = None,
     ):
@@ -80,18 +80,18 @@ class Qwen3OmniInferenceEngine:
         # when the scene shows the task is already finished.
         self.active_task_lang: Optional[str] = None
 
-        # State machine fields
-        self._sm_state: Optional[str] = None      # current confirmed state
-        self._sm_state_count: int = 0             # consecutive predictions in this state
-        self._SM_MAX_CONSECUTIVE: int = 6         # max before forcing reset to continue
-        # Minimum consecutive predictions needed before certain transitions are accepted
-        # gesture→withdraw needs 2 gestures first (prevents single-prediction locks)
-        self._sm_gesture_count: int = 0
-
         # Initialize client with connection pooling for low-latency
         try:
+            # Tight read timeout (was 30s). A normal inference returns in
+            # <1s (baseline p95 ~600ms); anything past a few seconds is a
+            # server-side stall (vLLM/Qwen3-Omni occasionally stops responding
+            # mid-stream, esp. on idle/silent input). With 1 worker + queue
+            # backpressure, one stuck call freezes the WHOLE prediction pipeline
+            # until this timeout fires — so 30s meant a 30s "hang". 8s read
+            # timeout makes a stall raise quickly; the worker then backs off 2s
+            # and resumes listening, so the system recovers instead of hanging.
             http_client = httpx.Client(
-                timeout=30.0,
+                timeout=httpx.Timeout(8.0, connect=5.0),
                 limits=httpx.Limits(
                     max_keepalive_connections=4,  # reuse TCP connections
                     max_connections=8,            # allow parallel workers
@@ -124,10 +124,12 @@ class Qwen3OmniInferenceEngine:
             "type": "object",
             "properties": {
                 "predicted_intent": {"type": "string"},
+                "predicted_phase":  {"type": "string"},
                 "confidence":       {"type": "number", "minimum": 0, "maximum": 1},
                 "target_object":    {"type": "string"},
                 "task_complete":    {"type": "boolean"},
                 "reason":           {"type": "string", "maxLength": 200},
+                "spoken_command":   {"type": "string"},
             },
             "required": ["predicted_intent", "confidence", "target_object", "reason"],
             "additionalProperties": False,
@@ -328,95 +330,6 @@ If no specific object is targeted, use "none".
     def clear_history(self):
         """Reset — call when starting a new scene/video."""
         self.intent_history.clear()
-        self._sm_state = None
-        self._sm_state_count = 0
-        self._sm_gesture_count = 0
-
-    def apply_state_machine(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Filter predictions through a valid-transition state machine.
-
-        The physical manipulation cycle is universal to pick-and-place:
-            continue → approach → gesture → withdraw → continue → ...
-
-        Two safeguards prevent the "stuck state" problem:
-
-        1. TRANSITION GUARD on gesture → withdraw:
-           Requires at least 2 consecutive gesture predictions before
-           allowing a withdraw. Prevents a single stray withdraw from
-           locking the state machine into withdraw for the whole video.
-
-        2. STATE TIMEOUT:
-           Any non-continue state held for more than _SM_MAX_CONSECUTIVE
-           predictions is forcibly reset to continue.
-           This is the universal escape valve for any stuck state.
-
-        Blocked predictions are held at the current state (not converted),
-        so the FP budget stays neutral rather than shifting to another class.
-        """
-        raw   = parsed.get('predicted_intent', 'unknown')
-        state = self._sm_state
-
-        # Cold-start command intents bypass the visual motion state machine —
-        # they're discrete command events emitted by the WAITING prompt and
-        # should propagate untouched to PolicyRouter.
-        if isinstance(raw, str) and raw.startswith('command_'):
-            return parsed
-
-        # ── State timeout: force reset if stuck too long ──────────────────
-        if (self._sm_state_count >= self._SM_MAX_CONSECUTIVE
-                and state not in ('continue', 'unknown', None)):
-            logger.debug(f"SM timeout: {state} × {self._sm_state_count} → continue")
-            self._sm_state = 'continue'
-            self._sm_state_count = 0
-            self._sm_gesture_count = 0
-            state = 'continue'
-
-        # ── Valid transition table ────────────────────────────────────────
-        VALID = {
-            None:            {'continue', 'approach', 'unknown'},
-            'continue':      {'continue', 'approach', 'unknown'},
-            'approach':      {'approach', 'gesture', 'continue', 'unknown'},
-            'gesture':       {'gesture', 'unknown'},   # withdraw gated separately
-            'withdraw':      {'withdraw', 'continue', 'approach', 'unknown'},
-            'unknown':       {'continue', 'approach', 'gesture',
-                              'withdraw', 'point', 'change_target', 'interrupt', 'unknown'},
-            'point':         {'point', 'continue', 'approach', 'unknown'},
-            'change_target': {'approach', 'gesture', 'unknown'},
-            'interrupt':     {'continue', 'unknown'},
-        }
-
-        allowed = VALID.get(state, VALID[None])
-
-        # ── Special gate: gesture → withdraw requires 2+ gestures first ──
-        if raw == 'withdraw' and state == 'gesture':
-            if self._sm_gesture_count >= 2:
-                allowed = allowed | {'withdraw'}
-            # else: withdraw is NOT allowed yet — will be blocked below
-
-        if raw in allowed:
-            # Valid — accept
-            new_state = raw
-        else:
-            # Invalid — hold current state silently
-            new_state = state or 'continue'
-            logger.debug(f"SM blocked {state}→{raw}, holding {new_state}")
-            parsed['predicted_intent'] = new_state
-            parsed['reason'] = f"[sm:{raw}→{new_state}] " + parsed.get('reason','')
-
-        # ── Update counters ───────────────────────────────────────────────
-        if new_state == self._sm_state:
-            self._sm_state_count += 1
-        else:
-            self._sm_state_count = 1
-
-        if new_state == 'gesture':
-            self._sm_gesture_count += 1
-        else:
-            self._sm_gesture_count = 0
-
-        self._sm_state = new_state
-        return parsed
 
     def build_user_prompt(
         self,
@@ -447,6 +360,13 @@ If no specific object is targeted, use "none".
             "Predict the near-future intention of the agent in the scene. "
             "Identify which object is targeted."
         )
+        # Append /no_think to skip Qwen3's thinking mode without triggering
+        # the broken guided-decoding-with-enable_thinking=False bug (vLLM
+        # Issue #18819). With chat_template_kwargs.enable_thinking=False the
+        # reasoning parser is bypassed and the guided_json output becomes
+        # gibberish (random fragments, prompt regurgitation, empty streams).
+        # The "/no_think" soft-switch produces valid JSON instead.
+        parts.append("/no_think")
         return "\n".join(parts)
     
     def predict_intent(
@@ -508,8 +428,7 @@ If no specific object is targeted, use "none".
                 top_p=self.top_p,
                 max_tokens=self.max_tokens,
                 stream=True,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            )
+                            )
             result_text = self._stream_until_json(stream)
 
             # Retry video-only if audio caused empty response
@@ -530,8 +449,7 @@ If no specific object is targeted, use "none".
                     top_p=self.top_p,
                     max_tokens=self.max_tokens,
                     stream=True,
-                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-                )
+                                    )
                 result_text = self._stream_until_json(stream_retry)
 
             # Parse JSON output
@@ -610,8 +528,7 @@ If no specific object is targeted, use "none".
                 temperature=self.temperature,
                 top_p=self.top_p,
                 max_tokens=self.max_tokens,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-                stream=True,
+                                stream=True,
             )
             result_text = self._stream_until_json(stream)
 
@@ -723,6 +640,317 @@ If no specific object is targeted, use "none".
         else:
             return [f"t-{n-1-i}s" if i < n - 1 else "t-now" for i in range(n)]
 
+    # ──────────────────────────────────────────────────────────────
+    # Fast-lane command classifier (audio-only Qwen call)
+    #
+    # Purpose: a SEPARATE Qwen inference path specialised for reactive
+    # command detection (stop, switch, cold-start). Sits alongside the
+    # main future-intent prediction (which keeps running every 250 ms
+    # with full audio+video for the thesis contribution).
+    #
+    # Design rationale:
+    #   - Audio-only payload eliminates the dominant failure mode
+    #     (audio+video fusion failure on short utterances).
+    #   - Minimal prompt eliminates JSON parse-failure noise.
+    #   - Short audio (clean recent speech) keeps the encoder happy.
+    #   - Different prompt prefix → independent vLLM cache → no
+    #     interference with the main prediction stream.
+    #
+    # Robot-agnostic: only the command enum mentions the current task
+    # names. For G1 or any other robot, the task list is built from
+    # the TaskRegistry — no other change needed.
+    # ──────────────────────────────────────────────────────────────
+
+    def _build_classifier_prompt(self) -> str:
+        """Build the command-classifier system prompt.
+
+        Enumerates available task names so the model can emit
+        ``command_pick_<name>`` and ``switch_<color>`` values that the
+        router consumes directly. Rebuilt on demand (cheap, ~few hundred
+        bytes) so adding a task to tasks.yaml requires no engine change.
+        """
+        task_lines = []
+        switch_lines = []
+        for label, obj in (self._cold_start_choices or []):
+            # label is "command_pick_<name>"; we want a hint about the
+            # spoken trigger
+            task_lines.append(f'- "{label}" — heard a fresh task command for {obj}')
+            color = obj.split()[0] if obj else label
+            switch_lines.append(f'- "switch_{color}" — heard "{color}" only (no full command), redirect mid-task')
+
+        prompt = (
+            'You are a fast audio-only command classifier for a robot. '
+            'You hear ~0.5-2 s of audio. Output a single JSON object — no extra text.\n'
+            '\n'
+            'Classify the audio into ONE of these classes:\n'
+            '- "stop" — heard stop / halt / wait / cancel / abort\n'
+        )
+        if task_lines:
+            prompt += '\n'.join(task_lines) + '\n'
+        if switch_lines:
+            prompt += '\n'.join(switch_lines) + '\n'
+        prompt += (
+            '- "none" — silence, background noise, or no clear command\n'
+            '\n'
+            'Output ONLY JSON in this exact shape:\n'
+            '{"command":"<class>","confidence":0.0-1.0,"heard":"<verbatim words or empty>"}\n'
+        )
+        return prompt
+
+    def classify_command(
+        self,
+        audio_window: np.ndarray,
+        sample_rate: int = 16000,
+    ) -> Dict[str, Any]:
+        """Audio-only command classification — used by the speech-onset
+        fast lane in StreamingIntentPredictor.
+
+        Returns ``{"command": "<class>", "confidence": float, "heard": "<text>"}``.
+        """
+        if self.client is None:
+            return {"command": "none", "confidence": 0.0, "heard": "",
+                    "error": "no client"}
+        # Keep only the most recent ~1 s of audio — that's where the
+        # speech burst lives after the audio_callback's onset clear.
+        if len(audio_window) > sample_rate:
+            audio_window = audio_window[-sample_rate:]
+        try:
+            audio_b64 = self.encode_audio_to_base64(audio_window, sample_rate)
+            if not audio_b64:
+                return {"command": "none", "confidence": 0.0, "heard": "",
+                        "error": "no audio"}
+
+            system_prompt = self._build_classifier_prompt()
+            user_text = (
+                "Classify this audio. Output one JSON object exactly as specified.\n"
+                "/no_think"  # see Issue #18819 workaround — keeps guided JSON valid
+            )
+            content: list = [
+                {"type": "text", "text": user_text},
+                {"type": "input_audio",
+                 "input_audio": {"data": audio_b64, "format": "wav"}},
+            ]
+
+            stream = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content},
+                ],
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_tokens=60,   # tighter cap — output is ~30 tokens
+                stream=True,
+                            )
+            result_text = self._stream_until_json(stream)
+
+            # Best-effort JSON parse with robust fallbacks. The model
+            # occasionally wraps in code fences or adds preamble.
+            import json
+            import re
+            text = result_text.strip()
+            if not text:
+                return {"command": "none", "confidence": 0.0, "heard": "",
+                        "error": "empty"}
+            # Strip ```json fences
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            # Take first { ... } block
+            m = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+            if m:
+                text = m.group(0)
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                # Fallback: keyword detection in raw text
+                low = result_text.lower()
+                if any(w in low for w in ("stop", "halt", "wait", "cancel")):
+                    parsed = {"command": "stop", "confidence": 0.7,
+                              "heard": result_text[:60]}
+                else:
+                    parsed = {"command": "none", "confidence": 0.0,
+                              "heard": ""}
+            return {
+                "command": str(parsed.get("command", "none")).strip().lower(),
+                "confidence": float(parsed.get("confidence", 0.0)),
+                "heard": str(parsed.get("heard", "")).strip(),
+            }
+        except Exception as e:
+            logger.error(f"classify_command error: {e}")
+            return {"command": "none", "confidence": 0.0, "heard": "",
+                    "error": str(e)}
+
+    def verify_object_present(
+        self,
+        object_name: str,
+        video_frame: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Visual feasibility check: is there a graspable object to pick at all?
+
+        A focused, vision-only Qwen call used as a feasibility gate before the
+        robot starts or switches to a pick task. This is SayCan-style "world
+        grounding": the perception model can veto a verbal command when the
+        workspace has nothing pickable in it (e.g. "pick the ball" at an empty
+        table). It does NOT use audio — it judges purely by what is in frame.
+
+        Why a generic "is anything pickable here" question instead of "is the
+        EXACT object present": Qwen's naming of these small objects is
+        unreliable — it labels the same pink/yellow cotton balls "purple/cyan/
+        blue" and flips between "cotton ball" and "yarn" frame to frame. Both
+        exact-color and exact-noun matching produced false vetoes on valid
+        picks. So we ask the question the model answers reliably — "is there a
+        small graspable object on the table?" — and trust its boolean rather
+        than string-matching its words. Honest trade-off: this catches the
+        empty-workspace case but cannot distinguish "pick red when only yellow
+        is present" — robust per-object color/identity grounding is beyond what
+        this model does dependably.
+
+        Returns ``{present, seen, grounded}``. Fails OPEN (present=True,
+        grounded=False) on any error so a grounding outage never makes the
+        system worse than having no gate at all.
+        """
+        fail_open = {"present": True, "seen": [], "grounded": False}
+        if self.client is None or video_frame is None:
+            return fail_open
+        try:
+            frame_b64 = self.encode_image_to_base64(video_frame)
+            if not frame_b64:
+                return fail_open
+            prompt = (
+                "Look ONLY at the image (there is no audio). The robot is about "
+                f"to try to pick up a small object (a \"{object_name}\").\n"
+                "Question: is there AT LEAST ONE small, graspable object (the one "
+                "described above, or any similar small item) actually sitting in "
+                "the workspace that the arm could pick up? Ignore the robot arm, "
+                "the plate/bowl, and the bare table surface. Do NOT worry about "
+                "exact color or what it is called — judge only whether a pickable "
+                "object is physically present.\n"
+                "Reply with JSON only:\n"
+                '{"pickable_present": true or false, '
+                '"seen": ["small objects you see, by color and type"]}\n'
+                "/no_think"  # Issue #18819 workaround — keeps JSON valid
+            )
+            content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
+            ]
+            stream = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content":
+                     "You are a visual feasibility checker for a robot arm. You "
+                     "report only what is physically visible in the image, never "
+                     "what you were asked to find."},
+                    {"role": "user", "content": content},
+                ],
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_tokens=self.max_tokens,
+                stream=True,
+            )
+            text = self._stream_until_json(stream)
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if not match:
+                logger.warning("verify_object_present: no JSON (%r) — failing open",
+                               text[:80])
+                return fail_open
+            data = json.loads(match.group(0))
+            return {
+                "present": bool(data.get("pickable_present", True)),
+                "seen": [str(s) for s in data.get("seen", []) if s],
+                "grounded": True,
+            }
+        except Exception as e:
+            logger.warning("verify_object_present error: %s — failing open", e)
+            return fail_open
+
+    def verify_task_complete(
+        self,
+        object_name: str,
+        video_frame: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Visual completion check: is the pick-and-place task actually DONE?
+
+        GR00T has no internal "done" signal and loops forever, and the inline
+        ``task_complete`` field in the streaming prediction fires <0.3% of the
+        time (it is buried in a 7-field multi-task JSON, which the model handles
+        unreliably). This dedicated, vision-only call asks the focused question
+        the model answers reliably — "is an object now in the bowl AND the
+        gripper empty?" — the same pattern that made the grounding gate work.
+
+        The two-part criterion (object placed AND gripper empty) is what stops
+        the robot from halting mid-transport: while the gripper still holds the
+        object, this returns False. It judges by the image, not by the phase
+        label, so it works even when Qwen mislabels the phase (e.g. yellow,
+        which the model never tags "placing").
+
+        Returns ``{complete, confidence, grounded}``. Fails SAFE (complete=False)
+        on any error so a glitch never stops the robot prematurely — the
+        max-runtime cap remains the ultimate backstop.
+        """
+        fail = {"complete": False, "confidence": 0.0, "reason": "", "grounded": False}
+        if self.client is None or video_frame is None:
+            return fail
+        try:
+            frame_b64 = self.encode_image_to_base64(video_frame)
+            if not frame_b64:
+                return fail
+            # Focus the model on the BOWL contents, not the gripper. After a
+            # successful place, GR00T loops back and closes the (empty) gripper
+            # on the table — which looks "holding" to Qwen and defeats any
+            # gripper-state criterion. "Is a ball resting inside the bowl" is the
+            # signal that actually defines completion and avoids that trap.
+            prompt = (
+                "Look ONLY at the image (there is no audio). A robot was asked "
+                'to pick up a "' + object_name + '" and place it in the '
+                "bowl/plate.\n"
+                "Look SPECIFICALLY at the bowl/plate. Is a small ball now "
+                "resting INSIDE the bowl/plate — already dropped in and released "
+                "(NOT still being carried or held in the gripper above it)?\n"
+                "Answer true only if a ball is clearly sitting inside the "
+                "bowl/plate. If the bowl is empty, or the ball is still being "
+                "carried/lifted, answer false. Ignore exact color.\n"
+                "Reply with JSON only:\n"
+                '{"complete": true or false, "confidence": 0.0-1.0, '
+                '"reason": "<8 words>"}\n'
+                "/no_think"  # Issue #18819 workaround — keeps JSON valid
+            )
+            content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
+            ]
+            stream = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content":
+                     "You are a task-completion checker for a robot arm. You "
+                     "report only what is physically visible in the image."},
+                    {"role": "user", "content": content},
+                ],
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_tokens=self.max_tokens,
+                stream=True,
+            )
+            text = self._stream_until_json(stream)
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if not match:
+                logger.warning("verify_task_complete: no JSON (%r) — failing safe",
+                               text[:80])
+                return fail
+            data = json.loads(match.group(0))
+            return {
+                "complete": bool(data.get("complete", False)),
+                "confidence": float(data.get("confidence", 0.0)),
+                "reason": str(data.get("reason", "")),
+                "grounded": True,
+            }
+        except Exception as e:
+            logger.warning("verify_task_complete error: %s — failing safe", e)
+            return fail
+
     def predict_intent_multi_frame(
         self,
         audio_window: np.ndarray,
@@ -776,7 +1004,8 @@ If no specific object is targeted, use "none".
             if robot_state:
                 prompt += f"Robot state: {robot_state}\n"
             if not is_waiting:
-                prompt += "Predict the agent's near-future intention and identify which object is targeted."
+                prompt += "Predict the agent's near-future intention and identify which object is targeted.\n"
+            prompt += "/no_think"  # Issue #18819 workaround — keeps guided JSON valid
 
             content: list = [
                 {"type": "text", "text": prompt},
@@ -799,36 +1028,73 @@ If no specific object is targeted, use "none".
                 top_p=self.top_p,
                 max_tokens=self.max_tokens,
                 stream=True,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            )
+                            )
             result_text = self._stream_until_json(stream)
             parsed = self._parse_prediction(result_text)
 
-            # Retry video-only when response is empty OR parse failed (garbage JSON).
-            # Both indicate audio encoder degeneration from motor noise.
-            # Must use _FAST_PROMPT_VIDEO_ONLY — the EXECUTING prompt says "You receive
-            # BOTH video AND audio", causing Qwen to return empty when audio is absent.
+            # Smart retry on empty response / parse failure: branch on
+            # whether the audio actually had speech in it.
+            #
+            # - Speech present → AUDIO-ONLY retry. Preserves the spoken
+            #   command (stop, switch keyword) which is what we care about
+            #   most in this case. Drops video — but motion can be inferred
+            #   from the next inference tick. Critical: fixes the "stop was
+            #   in audio but got dropped on retry" failure mode.
+            # - Audio essentially silent → VIDEO-ONLY retry (legacy path).
+            #   Audio had nothing useful anyway; visual scene is what we
+            #   need to know.
+            #
+            # The threshold is generous (~RMS 0.005, well below the gate's
+            # 0.012). If anything voiced got through, we treat it as speech.
             if audio_b64 and (not result_text.strip() or parsed.get('_parse_failed')):
-                logger.warning("Multi-frame: degenerate response with audio — retrying video-only")
-                content_retry: list = [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
-                ]
-                stream_retry = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": self._FAST_PROMPT_VIDEO_ONLY},
-                        {"role": "user", "content": content_retry},
-                    ],
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    max_tokens=self.max_tokens,
-                    stream=True,
-                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-                )
-                result_text = self._stream_until_json(stream_retry)
-                parsed = self._parse_prediction(result_text)
+                audio_rms = float(np.sqrt(np.mean(audio_window.astype(np.float32) ** 2)))
+                had_speech = audio_rms >= 0.005
+
+                if had_speech and hasattr(self, '_FAST_PROMPT_AUDIO_ONLY'):
+                    logger.warning("Multi-frame: degenerate response with audio "
+                                   "— retrying AUDIO-only (RMS=%.4f, speech present)",
+                                   audio_rms)
+                    content_retry: list = [
+                        {"type": "text", "text":
+                         "Listen to the audio and classify per the system prompt.\n"
+                         "/no_think"},  # Issue #18819 workaround
+                        {"type": "input_audio",
+                         "input_audio": {"data": audio_b64, "format": "wav"}},
+                    ]
+                    stream_retry = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=[
+                            {"role": "system", "content": self._FAST_PROMPT_AUDIO_ONLY},
+                            {"role": "user", "content": content_retry},
+                        ],
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        max_tokens=self.max_tokens,
+                        stream=True,
+                                            )
+                    result_text = self._stream_until_json(stream_retry)
+                    parsed = self._parse_prediction(result_text)
+                else:
+                    logger.warning("Multi-frame: degenerate response — retrying video-only "
+                                   "(RMS=%.4f, silent)", audio_rms)
+                    content_retry: list = [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
+                    ]
+                    stream_retry = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=[
+                            {"role": "system", "content": self._FAST_PROMPT_VIDEO_ONLY},
+                            {"role": "user", "content": content_retry},
+                        ],
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        max_tokens=self.max_tokens,
+                        stream=True,
+                                            )
+                    result_text = self._stream_until_json(stream_retry)
+                    parsed = self._parse_prediction(result_text)
 
             parsed['raw_response'] = result_text
             return parsed
@@ -883,7 +1149,8 @@ If no specific object is targeted, use "none".
                 prompt += f"Known objects: {', '.join(self.scene_objects)}\n"
             if robot_state:
                 prompt += f"Robot state: {robot_state}\n"
-            prompt += "Predict the agent's near-future intention and identify which object is targeted."
+            prompt += "Predict the agent's near-future intention and identify which object is targeted.\n"
+            prompt += "/no_think"  # Issue #18819 workaround — keeps guided JSON valid
 
             content: list = [
                 {"type": "text", "text": prompt},
@@ -901,8 +1168,7 @@ If no specific object is targeted, use "none".
                 top_p=self.top_p,
                 max_tokens=self.max_tokens,
                 stream=True,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            )
+                            )
             result_text = self._stream_until_json(stream)
             parsed = self._parse_prediction(result_text)
             parsed['raw_response'] = result_text
@@ -953,6 +1219,9 @@ If no specific object is targeted, use "none".
                 if 'reason' not in parsed:
                     parsed['reason'] = 'No reason provided'
                 parsed['task_complete'] = bool(parsed.get('task_complete', False))
+                parsed['predicted_phase'] = str(
+                    parsed.get('predicted_phase', 'unknown') or 'unknown'
+                ).strip().lower()
 
                 return parsed
             else:
@@ -960,6 +1229,15 @@ If no specific object is targeted, use "none".
                 
         except Exception as e:
             logger.warning(f"JSON parse failed, trying regex fallback: {e}")
+            # Log the raw response so we can diagnose whether failures are
+            # token-budget truncation (response ends mid-JSON, no closing
+            # brace), server-side aborts (truly empty / whitespace), or
+            # malformed content. Added May 19 during parse-failure
+            # investigation. Length-capped to keep log lines readable.
+            _raw = (response or "").replace("\n", "\\n")
+            if len(_raw) > 240:
+                _raw = _raw[:240] + f"...(+{len(response) - 240} chars)"
+            logger.warning(f"  raw response was: {_raw!r}")
 
         # ── Regex fallback ──────────────────────────────────────────────
         # If the model produced text that looks like intent output but
@@ -967,6 +1245,9 @@ If no specific object is targeted, use "none".
         # extract what we can.
         intent_match = re.search(
             r'"predicted_intent"\s*:\s*"(\w+)"', response
+        )
+        phase_match = re.search(
+            r'"predicted_phase"\s*:\s*"(\w+)"', response
         )
         conf_match = re.search(
             r'"confidence"\s*:\s*([\d.]+)', response
@@ -985,6 +1266,7 @@ If no specific object is targeted, use "none".
             conf = max(0.0, min(1.0, float(conf_match.group(1)))) if conf_match else 0.5
             return {
                 'predicted_intent': intent_match.group(1),
+                'predicted_phase': phase_match.group(1).lower() if phase_match else 'unknown',
                 'confidence': conf,
                 'target_object': obj_match.group(1) if obj_match else 'none',
                 'task_complete': tc_match.group(1).lower() == 'true' if tc_match else False,
@@ -1036,16 +1318,20 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
     - Concise system prompt that emphasises frame-to-frame comparison
     """
 
-    _FAST_PROMPT_EXECUTING = (
+    # Legacy prompt — kept for revert. To roll back, set:
+    #     _FAST_PROMPT_EXECUTING = _FAST_PROMPT_EXECUTING_LEGACY
+    _FAST_PROMPT_EXECUTING_LEGACY = (
         'Camera watching a 6-DOF SO101 robot arm with gripper on a workspace.\n'
         'Objects on workspace: cotton balls (pink, yellow).\n'
         'Frames oldest→newest (composite panels left→right).\n'
         'You receive BOTH video AND audio. Audio may contain human voice commands.\n'
         '\n'
-        'TWO JOBS — do both every call:\n'
+        'THREE JOBS — do all three every call:\n'
         '1. LISTEN: Transcribe any spoken words verbatim into spoken_command.\n'
         '   spoken_command = "" if silent or only background/motor noise.\n'
-        '2. WATCH: Classify the arm motion into predicted_intent.\n'
+        '2. WATCH (short horizon, ~1-2s): Classify arm motion into predicted_intent.\n'
+        '3. WATCH (longer horizon, ~3-5s): Classify the current task PHASE into\n'
+        '   predicted_phase — what subaction the arm is in / will be in next.\n'
         '\n'
         'STOP/INTERRUPT RULE (highest priority):\n'
         'If you hear "stop", "halt", "wait", "cancel" — set\n'
@@ -1055,7 +1341,7 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
         'If you hear a command to switch objects ("yellow one", "other ball", etc.)\n'
         'set predicted_intent="change_target" AND spoken_command=<words heard>.\n'
         '\n'
-        'predicted_intent values:\n'
+        'predicted_intent values (next 1-2s):\n'
         '- "continue" — gripper barely moving\n'
         '- "approach" — gripper moving toward object, claws open\n'
         '- "gesture" — gripper closed on object, holding/moving it\n'
@@ -1064,75 +1350,50 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
         '- "change_target" — heard switch command OR trajectory redirecting\n'
         '- "unknown" — unclear\n'
         '\n'
+        'predicted_phase values (next 3-5s subaction):\n'
+        '- "approaching" — moving toward target, not yet contacting\n'
+        '- "grasping"    — closing gripper on target object\n'
+        '- "transporting"— holding object, moving it toward destination\n'
+        '- "placing"     — releasing object at destination\n'
+        '- "retracting"  — moving back to home/idle pose after task\n'
+        '- "idle"        — no active subaction\n'
+        '- "unknown"     — unclear\n'
+        '\n'
         'task_complete: true ONLY if target object is visibly at its destination '
         '(ball in bowl/plate). Ignore arm position. Default false.\n'
         '\n'
         'EXAMPLE 1 — silence, arm grasping pink ball:\n'
-        '{"spoken_command":"","predicted_intent":"gesture","confidence":0.95,'
-        '"target_object":"pink cotton ball","task_complete":false,'
+        '{"spoken_command":"","predicted_intent":"gesture","predicted_phase":"grasping",'
+        '"confidence":0.95,"target_object":"pink cotton ball","task_complete":false,'
         '"reason":"Gripper closed on pink ball, lifting it"}\n'
         '\n'
         'EXAMPLE 2 — human says "stop" while arm moves:\n'
-        '{"spoken_command":"stop","predicted_intent":"interrupt","confidence":0.95,'
-        '"target_object":"yellow cotton ball","task_complete":false,'
+        '{"spoken_command":"stop","predicted_intent":"interrupt","predicted_phase":"idle",'
+        '"confidence":0.95,"target_object":"yellow cotton ball","task_complete":false,'
         '"reason":"Verbal stop command heard, arm mid-motion"}\n'
         '\n'
         'EXAMPLE 3 — human says "pick up the yellow one" while arm holds pink:\n'
         '{"spoken_command":"pick up the yellow one","predicted_intent":"change_target",'
-        '"confidence":0.9,"target_object":"yellow cotton ball","task_complete":false,'
-        '"reason":"Switch command heard, redirecting to yellow ball"}\n'
+        '"predicted_phase":"approaching","confidence":0.9,"target_object":"yellow cotton ball",'
+        '"task_complete":false,"reason":"Switch command, redirecting to yellow ball"}\n'
         '\n'
         'EXAMPLE 4 — silence, arm approaching pink ball:\n'
-        '{"spoken_command":"","predicted_intent":"approach","confidence":0.9,'
-        '"target_object":"pink cotton ball","task_complete":false,'
+        '{"spoken_command":"","predicted_intent":"approach","predicted_phase":"approaching",'
+        '"confidence":0.9,"target_object":"pink cotton ball","task_complete":false,'
         '"reason":"Gripper moving toward pink ball, claws open"}\n'
         '\n'
         'Reply ONLY with JSON in this exact field order: '
         '{"spoken_command":"<verbatim words or empty>",'
-        '"predicted_intent":"<class>","confidence":0.0-1.0,'
-        '"target_object":"<object color or none>",'
-        '"task_complete":false,'
-        '"reason":"<15 words max>"}'
+        '"predicted_intent":"<class>","predicted_phase":"<phase>",'
+        '"confidence":0.0-1.0,"target_object":"<object color or none>",'
+        '"task_complete":false,"reason":"<15 words max>"}'
     )
 
-
-    # Video-only system prompt — used by predict_intent_video_only_multi_frame.
-    # Must NOT mention audio; Qwen3-Omni returns empty when told "you receive
-    # BOTH video AND audio" but only an image is sent in the request.
-    _FAST_PROMPT_VIDEO_ONLY = (
-        'Camera watching a 6-DOF SO101 robot arm with gripper on a workspace.\n'
-        'Objects on workspace: cotton balls (pink, yellow).\n'
-        'Frames oldest→newest (composite panels left→right). NO audio.\n'
-        '\n'
-        'predicted_intent values:\n'
-        '- "continue" — gripper barely moving\n'
-        '- "approach" — gripper moving toward object, claws open\n'
-        '- "gesture" — gripper closed on object, holding/moving it\n'
-        '- "withdraw" — gripper moving away after release\n'
-        '- "change_target" — trajectory redirecting to different object\n'
-        '- "interrupt" — sudden freeze mid-motion\n'
-        '- "unknown" — unclear\n'
-        '\n'
-        'task_complete: true ONLY if target object is visibly at its destination '
-        '(ball in bowl/plate). Default false.\n'
-        '\n'
-        'EXAMPLE 1:\n'
-        '{"spoken_command":"","predicted_intent":"approach","confidence":0.9,'
-        '"target_object":"pink cotton ball","task_complete":false,'
-        '"reason":"Gripper moving toward pink ball"}\n'
-        '\n'
-        'EXAMPLE 2:\n'
-        '{"spoken_command":"","predicted_intent":"gesture","confidence":0.95,'
-        '"target_object":"yellow cotton ball","task_complete":false,'
-        '"reason":"Gripper closed, holding yellow ball"}\n'
-        '\n'
-        'Reply ONLY with JSON: '
-        '{"spoken_command":"",'
-        '"predicted_intent":"<class>","confidence":0.0-1.0,'
-        '"target_object":"<object or none>",'
-        '"task_complete":false,'
-        '"reason":"<15 words max>"}'
-    )
+    # The EXECUTING / VIDEO_ONLY / AUDIO_ONLY prompts are now built from the
+    # task registry at construction time — see _build_executing_prompt,
+    # _build_video_only_prompt, _build_audio_only_prompt above. They are cached
+    # as instance attributes (self._FAST_PROMPT_*) in __init__. The legacy
+    # hardcoded EXECUTING constant is preserved below for one-line revert.
 
     # WAITING prompt — Qwen-only cold-start experiment (April 25).
     # Encodes cold-start commands AS predicted_intent enum values
@@ -1153,14 +1414,19 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
             for intent, obj in choices
         )
         example_intent, example_obj = choices[0]
+        example_color = example_obj.split()[0]
         return (
             'Camera watching a 6-DOF SO101 robot arm (idle) on a workspace.\n'
             'The robot is IDLE waiting for a verbal task command from the human.\n'
             'You receive BOTH video AND audio.\n'
             '\n'
             'YOUR JOB: classify whether the human just spoke a verbal command\n'
-            'to start a task. Output one of these values in predicted_intent:\n'
+            'to start (or RESUME) a task. Output one of these values in\n'
+            'predicted_intent:\n'
             f'{bullets}\n'
+            '  - "command_resume" — heard "continue" / "resume" / "keep going" /\n'
+            '     "go on" / "carry on" / "proceed" (user wants to RESUME the last\n'
+            '     paused task, not start a new one)\n'
             '  - "none" — silence, background noise, or speech unrelated to a task\n'
             '\n'
             'CRITICAL RULES:\n'
@@ -1174,18 +1440,162 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
             '{"predicted_intent":"none","confidence":0.95,'
             '"target_object":"none","reason":"Workspace silent, no verbal command"}\n'
             '\n'
-            f'EXAMPLE B — human says "pick up the pink one":\n'
-            '{"predicted_intent":"command_pick_pink_ball","confidence":0.9,'
-            '"target_object":"pink cotton ball","reason":"Heard verbal command for pink ball"}\n'
+            'EXAMPLE B — human says "pick up the ' + example_color + ' one":\n'
+            '{"predicted_intent":"' + example_intent + '","confidence":0.9,'
+            '"target_object":"' + example_obj + '","reason":"Heard verbal command for ' + example_color + ' object"}\n'
             '\n'
             'EXAMPLE C — human says "hello there" (unrelated chatter):\n'
             '{"predicted_intent":"none","confidence":0.9,'
             '"target_object":"none","reason":"Unrelated speech, no task command"}\n'
             '\n'
+            'EXAMPLE D — human says "continue" (after a previous stop):\n'
+            '{"predicted_intent":"command_resume","confidence":0.95,'
+            '"target_object":"none","reason":"Heard resume command"}\n'
+            '\n'
             'Reply ONLY with JSON: '
             '{"predicted_intent":"<value>","confidence":0.0-1.0,'
             '"target_object":"<object color or none>",'
             '"reason":"<short, 15 words max>"}'
+        )
+
+    def _task_object_names(self) -> list:
+        """Object names for the active task set, taken from the task registry
+        (cold_start_choices), falling back to scene_objects then a generic
+        default. This is the single source the EXECUTING / VIDEO / AUDIO prompts
+        template from, so adding a task to tasks.yaml needs NO prompt edits and
+        no object name is hardcoded in any prompt."""
+        if self._cold_start_choices:
+            objs = [obj for (_, obj) in self._cold_start_choices if obj]
+            if objs:
+                return objs
+        if getattr(self, 'scene_objects', None):
+            return list(self.scene_objects)
+        return ['pink cotton ball', 'yellow cotton ball']
+
+    def _build_executing_prompt(self) -> str:
+        objs = self._task_object_names()
+        obj1 = objs[0]
+        obj2 = objs[1] if len(objs) > 1 else objs[0]
+        c1 = obj1.split()[0]
+        c2 = obj2.split()[0]
+        object_list = ", ".join(objs)
+        colors = [o.split()[0] for o in objs]
+        switch_kw = ", ".join('"' + c + '"' for c in colors) + ', "other", "not this", "instead"'
+        return (
+            'SO101 robot arm + gripper on workspace. Objects: ' + object_list + '; plus a bowl/plate.\n'
+            'Frames are oldest→newest panels. You receive video AND audio.\n'
+            '\n'
+            'JOB: Predict what happens in the NEXT 1-2 seconds (predicted_intent) and\n'
+            'the NEXT 3-5 seconds subaction (predicted_phase). Audio is a strong\n'
+            'predictor: what the human SAYS is what is about to happen.\n'
+            '\n'
+            'Also fill spoken_command with verbatim words heard ("" if silent/noise).\n'
+            '\n'
+            'PRIORITY RULES:\n'
+            '1. Hear stop/halt/wait/cancel → predicted_intent="interrupt",\n'
+            '   predicted_phase="retracting"\n'
+            '2. Hear switch (' + switch_kw + ') →\n'
+            '   predicted_intent="change_target", target_object=<new object>,\n'
+            '   predicted_phase="retracting" (arm SHOULD drop current and redirect —\n'
+            '   predict the future, not the past)\n'
+            '3. Target object visibly inside bowl/plate → task_complete=true\n'
+            '\n'
+            'predicted_intent (1-2s): continue | approach | gesture | withdraw |\n'
+            '  change_target | interrupt | unknown\n'
+            'predicted_phase (3-5s): approaching | grasping | transporting | placing |\n'
+            '  retracting | idle | unknown\n'
+            '\n'
+            'EX1 silent, arm grasping ' + c1 + ':\n'
+            '{"spoken_command":"","predicted_intent":"gesture","predicted_phase":"transporting",'
+            '"confidence":0.95,"target_object":"' + obj1 + '","task_complete":false,'
+            '"reason":"Holding ' + c1 + ', will move to bowl"}\n'
+            '\n'
+            'EX2 user says "wait stop" mid-pickup:\n'
+            '{"spoken_command":"wait stop","predicted_intent":"interrupt","predicted_phase":"retracting",'
+            '"confidence":0.95,"target_object":"' + obj1 + '","task_complete":false,'
+            '"reason":"Stop heard, arm should retract"}\n'
+            '\n'
+            'EX3 user says "no the ' + c2 + ' one" while holding ' + c1 + ':\n'
+            '{"spoken_command":"no the ' + c2 + ' one","predicted_intent":"change_target",'
+            '"predicted_phase":"retracting","confidence":0.9,"target_object":"' + obj2 + '",'
+            '"task_complete":false,"reason":"Drop ' + c1 + ', redirect to ' + c2 + '"}\n'
+            '\n'
+            'Reply ONLY with JSON: {"spoken_command":"...","predicted_intent":"...",'
+            '"predicted_phase":"...","confidence":0.0-1.0,"target_object":"...",'
+            '"task_complete":false,"reason":"<15 words>"}'
+        )
+
+    def _build_video_only_prompt(self) -> str:
+        objs = self._task_object_names()
+        obj1 = objs[0]
+        obj2 = objs[1] if len(objs) > 1 else objs[0]
+        c1 = obj1.split()[0]
+        c2 = obj2.split()[0]
+        object_list = ", ".join(objs)
+        return (
+            'Camera watching a 6-DOF SO101 robot arm with gripper on a workspace.\n'
+            'Objects on workspace: ' + object_list + '.\n'
+            'Frames oldest→newest (composite panels left→right). NO audio.\n'
+            '\n'
+            'predicted_intent values (next 1-2s):\n'
+            '- "continue" — gripper barely moving\n'
+            '- "approach" — gripper moving toward object, claws open\n'
+            '- "gesture" — gripper closed on object, holding/moving it\n'
+            '- "withdraw" — gripper moving away after release\n'
+            '- "change_target" — trajectory redirecting to different object\n'
+            '- "interrupt" — sudden freeze mid-motion\n'
+            '- "unknown" — unclear\n'
+            '\n'
+            'predicted_phase values (next 3-5s subaction):\n'
+            '- "approaching" | "grasping" | "transporting" | "placing" | "retracting" |\n'
+            '  "idle" | "unknown"\n'
+            '\n'
+            'task_complete: true ONLY if target object is visibly at its destination '
+            '(object in bowl/plate). Default false.\n'
+            '\n'
+            'EXAMPLE 1:\n'
+            '{"spoken_command":"","predicted_intent":"approach","predicted_phase":"approaching",'
+            '"confidence":0.9,"target_object":"' + obj1 + '","task_complete":false,'
+            '"reason":"Gripper moving toward ' + c1 + '"}\n'
+            '\n'
+            'EXAMPLE 2:\n'
+            '{"spoken_command":"","predicted_intent":"gesture","predicted_phase":"grasping",'
+            '"confidence":0.95,"target_object":"' + obj2 + '","task_complete":false,'
+            '"reason":"Gripper closed, holding ' + c2 + '"}\n'
+            '\n'
+            'Reply ONLY with JSON: '
+            '{"spoken_command":"","predicted_intent":"<class>","predicted_phase":"<phase>",'
+            '"confidence":0.0-1.0,"target_object":"<object or none>",'
+            '"task_complete":false,"reason":"<15 words max>"}'
+        )
+
+    def _build_audio_only_prompt(self) -> str:
+        objs = self._task_object_names()
+        colors = [o.split()[0] for o in objs]
+        color_list = ", ".join(colors)
+        color_hint = " / ".join('"' + c + '"' for c in colors)
+        return (
+            'Audio-only mode (no video). You hear ~2 s of audio that may contain '
+            'a spoken command for a robot.\n'
+            '\n'
+            'spoken_command: fill with the verbatim words heard ("" if silent/noise).\n'
+            '\n'
+            'predicted_intent values (audio-derived):\n'
+            '- "interrupt"     — heard stop / halt / wait / cancel / abort\n'
+            '- "change_target" — heard a different object/target (' + color_hint + ', "other")\n'
+            '- "continue"      — silence or non-command speech\n'
+            '- "unknown"       — unclear\n'
+            '\n'
+            'target_object: if you heard a known object color (' + color_list + '), set '
+            'the matching "<color> ..." object name; otherwise "none".\n'
+            '\n'
+            'predicted_phase: "retracting" if interrupt or change_target, else "unknown".\n'
+            '\n'
+            'Reply ONLY with JSON: '
+            '{"spoken_command":"<verbatim or empty>","predicted_intent":"<class>",'
+            '"predicted_phase":"<phase>","confidence":0.0-1.0,'
+            '"target_object":"<object or none>","task_complete":false,'
+            '"reason":"<10 words max>"}'
         )
 
     def __init__(
@@ -1205,9 +1615,30 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
             vllm_url=vllm_url,
             api_key=api_key,
             model_name=model_name,
-            temperature=0.1,   # near-greedy = fastest sampling
+            # Reverted May 19 evening from (0.01 / 0.1) back to (0.1 / 0.9).
+            # The Issue #139 reference config (0.01/0.1) was tried briefly
+            # but caused two new failure modes:
+            #   (a) deterministic prose responses — model emitted 549+ char
+            #       natural-language paragraphs instead of JSON when the
+            #       audio encoder was confused (visible in session log #58)
+            #   (b) stop detection during long executions got noticeably
+            #       worse — model commits early to a wrong path on
+            #       ambiguous audio rather than recovering probabilistically
+            # At 0.1/0.9 the sampler has enough entropy to find the JSON
+            # structure even when the encoder output is borderline.
+            temperature=0.1,
             top_p=0.9,
-            max_tokens=80,     # JSON output is ~40-60 tokens with target_object
+            # Token budget raised 80 → 160 on May 19 after diagnosing ~50%
+            # parse-failure rate in --no-vad sessions. Root cause: the May 18
+            # changes added `predicted_phase` (+5-8 tokens) AND the rewritten
+            # EXECUTING prompt now actually elicits long `spoken_command`
+            # values (10-15 tokens for phrases like "can you pick up the
+            # yellow ball"). Typical full response: 70-85 tokens — right at
+            # the old 80-token cap, causing mid-JSON truncation → empty
+            # streams. 160 gives generous headroom. Streaming stops at the
+            # closing `}` via _stream_until_json, so extra cap costs ~nothing
+            # in the happy path.
+            max_tokens=160,
             system_prompt=system_prompt,
             scene_objects=scene_objects,
         )
@@ -1229,6 +1660,15 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
 
         # Robot state for dynamic prompt switching
         self._current_robot_state = ''
+
+        # Build the task-specific prompts once from the registry (object names
+        # come from cold_start_choices). These instance attributes shadow the
+        # old hardcoded class constants, so every prompt now adapts to whatever
+        # tasks are in tasks.yaml with no per-task editing. The WAITING prompt
+        # is built per-call in _select_system_prompt (it already was dynamic).
+        self._FAST_PROMPT_EXECUTING = self._build_executing_prompt()
+        self._FAST_PROMPT_VIDEO_ONLY = self._build_video_only_prompt()
+        self._FAST_PROMPT_AUDIO_ONLY = self._build_audio_only_prompt()
 
     def encode_image_to_base64(self, video_frame: np.ndarray) -> str:
         """Override with balanced compression.
@@ -1361,8 +1801,7 @@ class FastQwenInferenceEngine(Qwen3OmniInferenceEngine):
                 ],
                 temperature=0.0,
                 max_tokens=60,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            )
+                            )
             text = response.choices[0].message.content or ""
             # Strip vLLM chat-template echo artifacts (e.g. "user\nStop", "assistant\nTranscribe:")
             _noise = {'user', 'assistant', 'system', 'transcribe:', 'transcribe'}

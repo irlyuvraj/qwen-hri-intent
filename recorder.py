@@ -2,8 +2,13 @@
 recorder.py — Async Session Recorder for Qwen3-Omni + GR00T HRI System
 ========================================================================
 Records a composite 1280×720 MP4 with audio:
-  LEFT  : Live camera feed with intent prediction overlay
-  RIGHT : Scrolling terminal log (top) + confidence timeline graph (bottom)
+  LEFT  : Live camera feed with intent prediction overlay (HUD card)
+  RIGHT : Scrolling terminal log (full height)
+
+The bottom-right confidence bar chart was removed — the HUD card on the
+camera panel already shows intent + confidence + bar, and the live
+telemetry dashboard (telemetry_dashboard.py) is the place for temporal
+plots.
 
 Audio is captured in parallel and muxed in at stop() via ffmpeg (-c copy
 for video, AAC for audio). If ffmpeg is absent the video-only file is kept.
@@ -40,16 +45,8 @@ class PredictionOutput:
     task_complete: bool = False
     reason: Optional[str] = None
     spoken_command: str = ""
+    predicted_phase: str = "unknown"
 
-# ── optional: matplotlib for the confidence graph ──────────────────────────
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    _HAS_MPL = True
-except ImportError:
-    _HAS_MPL = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,8 +147,8 @@ def _draw_camera_panel(frame_bgr: np.ndarray, pred: PredictionOutput,
          color=PALETTE["text_lo"], scale=0.45)
 
     # ── Bottom HUD card (bottom-left, not covering the robot centre) ──────
-    card_x, card_y = 10, panel_h - 142
-    card_w, card_h = 310, 130
+    card_x, card_y = 10, panel_h - 156
+    card_w, card_h = 310, 144
     _rect(cam, card_x, card_y, card_x + card_w, card_y + card_h,
           (10, 10, 10), alpha=0.72)
     # coloured left accent stripe
@@ -177,13 +174,19 @@ def _draw_camera_panel(frame_bgr: np.ndarray, pred: PredictionOutput,
     _put(cam, conf_str, pill_x + 4, card_y + 44,
          color=icolor, scale=0.45)
 
+    # phase row (3-5s horizon, complements the 1-2s predicted_intent above)
+    phase = (getattr(pred, "predicted_phase", "") or "unknown").strip()
+    phase_label = f"Phase:   {phase}"
+    _put(cam, phase_label, card_x + 10, card_y + 68,
+         color=PALETTE["text_lo"], scale=0.40)
+
     # target object row
     obj_label = f"Target:  {target}" if target else "Target:  —"
-    _put(cam, obj_label, card_x + 10, card_y + 68,
-         color=PALETTE["text_lo"], scale=0.44)
+    _put(cam, obj_label, card_x + 10, card_y + 82,
+         color=PALETTE["text_lo"], scale=0.40)
 
-    # confidence bar (thin)
-    bx, by_ = card_x + 10, card_y + 82
+    # confidence bar (thin) — shifted down by 14px to make room for phase row
+    bx, by_ = card_x + 10, card_y + 96
     blen = card_w - 20
     _rect(cam, bx, by_, bx + blen, by_ + 6, (40, 42, 48))
     _rect(cam, bx, by_, bx + int(blen * conf), by_ + 6, icolor)
@@ -191,13 +194,13 @@ def _draw_camera_panel(frame_bgr: np.ndarray, pred: PredictionOutput,
     # reason — WHY Qwen predicted this intent
     reason_raw = pred.reason or ""
     reason_txt = (reason_raw[:55] + "…") if len(reason_raw) > 55 else reason_raw
-    _put(cam, f"Reason: {reason_txt}", card_x + 10, card_y + 97,
+    _put(cam, f"Reason: {reason_txt}", card_x + 10, card_y + 111,
          color=PALETTE["text_lo"], scale=0.36)
 
     # speed stats row
     qwen_str  = f"Qwen {qwen_hz:.1f}Hz"  if qwen_hz  > 0.05 else "Qwen ---"
     groot_str = f"GR00T {groot_hz:.1f}Hz" if groot_hz > 0.05 else "GR00T ---"
-    _put(cam, f"{qwen_str}  ·  {groot_str}", card_x + 10, card_y + 113,
+    _put(cam, f"{qwen_str}  ·  {groot_str}", card_x + 10, card_y + 127,
          color=PALETTE["text_lo"], scale=0.35)
 
     # ── TASK COMPLETE badge (top-right) ───────────────────────────────────
@@ -231,96 +234,24 @@ def _draw_log_panel(log_lines: deque, panel_w: int, panel_h: int) -> np.ndarray:
     return img
 
 
-def _draw_graph_panel_mpl(history: deque, panel_w: int, panel_h: int) -> np.ndarray:
-    fig, ax = plt.subplots(figsize=(panel_w / 100, panel_h / 100), dpi=100)
-    fig.patch.set_facecolor("#191c23")
-    ax.set_facecolor("#191c23")
-
-    times   = [h[0] for h in history]
-    confs   = [h[1] for h in history]
-    intents = [h[2] for h in history]
-
-    ax.plot(times, confs, color="#00d48c", linewidth=1.5)
-    ax.fill_between(times, confs, alpha=0.15, color="#00d48c")
-
-    intent_map = {"approach": 0.9, "gesture": 0.75, "withdraw": 0.55,
-                  "continue": 0.4, "unknown": 0.1}
-    iy = [intent_map.get(i.lower(), 0.1) for i in intents]
-    scatter_colors = [
-        "#00c878" if i == "approach" else
-        "#00c8ff" if i == "gesture" else
-        "#e63232" if i == "withdraw" else "#aaaaaa"
-        for i in intents
-    ]
-    ax.scatter(times, iy, c=scatter_colors, s=12, zorder=5)
-
-    ax.set_ylim(-0.05, 1.05)
-    ax.set_xlim(max(0, times[-1] - 30) if times else 0, (times[-1] + 1) if times else 30)
-    ax.set_xlabel("time (s)", color="#808090", fontsize=7)
-    ax.set_ylabel("conf / intent", color="#808090", fontsize=7)
-    ax.tick_params(colors="#606070", labelsize=6)
-    for spine in ax.spines.values():
-        spine.set_color("#303040")
-    ax.set_title("Intent + Confidence Timeline", color="#e0e0e0", fontsize=8, pad=4)
-    ax.legend(handles=[
-        mpatches.Patch(color="#00c878", label="approach"),
-        mpatches.Patch(color="#00c8ff", label="gesture"),
-        mpatches.Patch(color="#e63232", label="withdraw"),
-        mpatches.Patch(color="#aaaaaa", label="continue"),
-    ], fontsize=5, loc="upper left",
-       facecolor="#191c23", edgecolor="#404050", labelcolor="#c0c0c0")
-
-    fig.tight_layout(pad=0.4)
-    fig.canvas.draw()
-    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close("all")
-    return cv2.cvtColor(cv2.resize(buf, (panel_w, panel_h)), cv2.COLOR_RGB2BGR)
-
-
-def _draw_graph_panel_cv2(history: deque, panel_w: int, panel_h: int) -> np.ndarray:
-    img = np.full((panel_h, panel_w, 3), PALETTE["panel_bg"], dtype=np.uint8)
-    _rect(img, 0, 0, panel_w, 28, PALETTE["bg"])
-    _put(img, "CONFIDENCE TIMELINE", 10, 19, color=PALETTE["accent"], scale=0.52)
-    if not history:
-        return img
-    plot_top, plot_bot = 36, panel_h - 20
-    plot_h = plot_bot - plot_top
-    plot_w = panel_w - 20
-    n      = len(history)
-    bar_w  = max(2, plot_w // max(n, 1))
-    x0     = 10
-    for i, (t, conf, intent) in enumerate(history):
-        bh    = int(plot_h * conf)
-        bx    = x0 + i * bar_w
-        color = INTENT_COLORS.get(intent.lower(), INTENT_COLORS["unknown"])
-        _rect(img, bx, plot_bot - bh, bx + max(bar_w - 1, 1), plot_bot, color)
-    cv2.line(img, (x0, plot_bot), (x0 + plot_w, plot_bot), PALETTE["text_lo"], 1)
-    _, last_conf, last_intent = history[-1]
-    _put(img, f"{last_intent}  {last_conf:.0%}", x0 + 5, plot_top - 5,
-         color=PALETTE["text_hi"], scale=0.45)
-    return img
-
-
-def _draw_graph_panel(history, panel_w, panel_h):
-    return _draw_graph_panel_cv2(history, panel_w, panel_h)
-
-
 def compose_frame(camera_bgr: np.ndarray, pred: PredictionOutput,
                   log_lines: deque, history: deque, elapsed: float,
                   out_w: int = 1280, out_h: int = 720,
                   qwen_hz: float = 0.0, groot_hz: float = 0.0,
                   pred_seq: int = 0) -> np.ndarray:
+    # Layout: camera (60%) | scrolling log (40%, full height).
+    # The bottom-right confidence bar chart was removed — the HUD card on
+    # the camera panel already shows intent + confidence + bar, and the
+    # log carries the textual history. The live telemetry dashboard
+    # (telemetry_dashboard.py) is the place for temporal plots.
+    # `history` is still accepted as a parameter for backwards-compatibility
+    # with callers but is no longer drawn.
+    del history  # explicitly unused
     left_w  = int(out_w * 0.60)
     right_w = out_w - left_w
-    log_h   = int(out_h * 0.55)
-    graph_h = out_h - log_h
     left  = _draw_camera_panel(camera_bgr, pred, left_w, out_h, elapsed,
                                qwen_hz, groot_hz, pred_seq)
-    right = np.vstack([
-        _draw_log_panel(log_lines, right_w, log_h),
-        _draw_graph_panel(history, right_w, graph_h),
-    ])
+    right = _draw_log_panel(log_lines, right_w, out_h)
     return np.hstack([left, right])
 
 

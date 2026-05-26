@@ -32,8 +32,6 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-
-@dataclass
 class StreamConfig:
     """Configuration for streaming system"""
     # Audio settings
@@ -83,6 +81,12 @@ class InferenceInput:
     robot_state: Optional[str] = None
     sequence_id: int = 0
     video_frames: Optional[List[np.ndarray]] = None  # multiple frames for motion context
+    # Fast-lane flag set by scheduler when this inference was triggered by an
+    # external speech-onset event (audio_callback). Fast-lane inferences use a
+    # smaller payload (1 frame, ~0.8s audio) so Qwen's audio encoder is less
+    # likely to return empty — reliability matters more than full context for
+    # detecting time-critical commands like "stop".
+    is_fast_lane: bool = False
 
 
 @dataclass
@@ -98,6 +102,10 @@ class PredictionOutput:
     raw_response: str = ""
     task_complete: bool = False  # Qwen visual scene completion signal
     spoken_command: str = ""     # verbatim command Qwen heard in audio (replaces VAD path)
+    # Longer-horizon (3-5s) phase prediction. Stable over multi-step subactions
+    # so the same accuracy holds further into the future than predicted_intent.
+    # Values: approaching | grasping | transporting | placing | retracting | idle | unknown
+    predicted_phase: str = "unknown"
 
 
 class RingBuffer:
@@ -283,6 +291,12 @@ class StreamingInferenceScheduler:
         self._last_gate_frame: Optional[np.ndarray] = None
         self._motion_skip_count: int = 0
         self._motion_fire_count: int = 0
+
+        # Fast-lane: external trigger to bypass the polling interval and fire
+        # an inference immediately. Set from audio_callback when speech onset
+        # is detected. Drops worst-case stop latency from (interval + inference)
+        # to (~0 + inference). Cleared by the scheduler after firing.
+        self._immediate_request = threading.Event()
         
     def start(self, num_workers: int = 2):
         """Start the scheduler and worker threads"""
@@ -390,7 +404,14 @@ class StreamingInferenceScheduler:
 
             effective_interval = self.config.inference_interval
 
-            if current_time >= next_inference_time:
+            # Fast-lane: if an external caller (audio onset detector) has
+            # requested an immediate inference, bypass the polling-interval
+            # check. The trigger flag is single-shot — clear it on consumption.
+            immediate = self._immediate_request.is_set()
+            if immediate:
+                self._immediate_request.clear()
+
+            if immediate or current_time >= next_inference_time:
                 # --- backpressure: skip if workers are already saturated ---
                 if self.inference_queue.qsize() >= len(self.inference_workers):
                     # Don't increment counter, don't enqueue.
@@ -421,6 +442,7 @@ class StreamingInferenceScheduler:
                         robot_state=self._current_robot_state,
                         sequence_id=self.sequence_counter,
                         video_frames=recent_frames if len(recent_frames) > 1 else None,
+                        is_fast_lane=immediate,
                     )
 
                     try:
@@ -438,37 +460,103 @@ class StreamingInferenceScheduler:
     def _inference_worker(self, worker_id: int):
         """Worker thread that processes inference inputs"""
         logger.info(f"Inference worker {worker_id} started")
-        
+        backoff_until = 0.0  # if vLLM is unreachable, sleep until this time
+
         while self.is_running:
             try:
-                # Get input from queue (with timeout)
+                if time.time() < backoff_until:
+                    time.sleep(0.2)
+                    continue
                 inference_input = self.inference_queue.get(timeout=0.5)
-                
-                # Run inference (this is where Qwen is called)
+
                 start_time = time.time()
                 prediction = self._run_inference(inference_input)
                 latency_ms = (time.time() - start_time) * 1000
-                
+
                 prediction.latency_ms = latency_ms
-                
-                # Add to output queue
                 self.prediction_queue.put(prediction)
-                
+
                 logger.debug(
                     f"Worker {worker_id}: seq={prediction.sequence_id}, "
                     f"intent={prediction.predicted_intent}, "
                     f"latency={latency_ms:.1f}ms"
                 )
-                
+
             except queue.Empty:
                 continue
             except Exception as e:
-                logger.error(f"Worker {worker_id} error: {e}")
+                # Detect vLLM disconnects and back off for 2s instead of
+                # hammering the server (or hanging the worker for 30s on
+                # the httpx default timeout).
+                msg = str(e).lower()
+                if any(s in msg for s in ("connect", "refused", "unreachable",
+                                          "timeout", "timed out")):
+                    logger.warning(f"Worker {worker_id}: vLLM unreachable ({e}); "
+                                   f"backing off 2s")
+                    backoff_until = time.time() + 2.0
+                else:
+                    logger.error(f"Worker {worker_id} error: {e}")
     
     def set_inference_engine(self, engine):
         """Set the Qwen inference engine"""
         self.inference_engine = engine
         logger.info("Inference engine set")
+
+    def _command_to_prediction(self, cmd_result: dict,
+                               input_data: 'InferenceInput') -> 'PredictionOutput':
+        """Map classify_command()'s output into a PredictionOutput.
+
+        The command classifier returns:
+            {"command": "stop|command_pick_<task>|switch_<color>|none",
+             "confidence": 0.0-1.0, "heard": "<verbatim>"}
+
+        We map it to existing intent values so PolicyRouter.handle_prediction
+        treats it identically to a full-intent result:
+            stop                  → predicted_intent="interrupt",
+                                    spoken_command="<heard>"
+            command_pick_<task>   → predicted_intent="command_pick_<task>"
+                                    (drives cold-start streak)
+            switch_<color>        → predicted_intent="change_target",
+                                    target_object="<color> cotton ball",
+                                    spoken_command="<heard>" (carries target)
+            none                  → predicted_intent="none"
+        """
+        cmd = (cmd_result.get("command") or "none").strip().lower()
+        conf = float(cmd_result.get("confidence", 0.0))
+        heard = (cmd_result.get("heard") or "").strip()
+
+        intent = "none"
+        target = "none"
+        spoken = heard
+        phase = "unknown"
+
+        if cmd == "stop":
+            intent = "interrupt"
+            phase = "retracting"
+            if not spoken:
+                spoken = "stop"
+        elif cmd.startswith("command_pick_"):
+            intent = cmd  # router consumes command_pick_* directly
+        elif cmd.startswith("switch_"):
+            color = cmd[len("switch_"):]
+            intent = "change_target"
+            phase = "retracting"
+            target = f"{color} cotton ball"
+            if not spoken:
+                spoken = color
+
+        return PredictionOutput(
+            timestamp=input_data.timestamp,
+            sequence_id=input_data.sequence_id,
+            predicted_intent=intent,
+            confidence=conf,
+            target_object=target,
+            reason=f"fast-lane: {cmd}",
+            raw_response=str(cmd_result),
+            task_complete=False,
+            spoken_command=spoken,
+            predicted_phase=phase,
+        )
     
     def _run_inference(self, input_data: InferenceInput) -> PredictionOutput:
         """
@@ -499,13 +587,21 @@ class StreamingInferenceScheduler:
                 audio_energy = np.abs(input_data.audio_window).max()
                 if audio_energy < 1e-6:
                     use_video_only = True
-                # During execution, audio is high-pass filtered (200 Hz cutoff)
-                # before being added to the buffer — motor-noise rumble is
-                # suppressed while the speech band (300Hz+) is preserved.
-                # Use the full multimodal path so Qwen can detect stop/switch
-                # commands via predicted_intent=interrupt/change_target.
-                # Video-only is only forced when audio energy is essentially
-                # zero (silence gate above) or audio is absent entirely.
+
+            # Fast-lane: dedicated audio-only command classifier path.
+            # Speech-onset-triggered inferences DO NOT need future-intent
+            # prediction — they need fast reliable command classification.
+            # We dispatch to a specialised engine method with its own minimal
+            # prompt and audio-only payload. This eliminates the dominant
+            # failure mode (audio+video encoder mismatch on short utterances)
+            # and gets us to ~100-200 ms inference time.
+            if (input_data.is_fast_lane and not use_video_only
+                    and hasattr(self.inference_engine, 'classify_command')):
+                cmd_result = self.inference_engine.classify_command(
+                    audio_window=input_data.audio_window,
+                    sample_rate=self.config.audio_sample_rate,
+                )
+                return self._command_to_prediction(cmd_result, input_data)
 
             # Prefer multi-frame methods when we have multiple frames
             frames = input_data.video_frames  # List or None
@@ -555,6 +651,7 @@ class StreamingInferenceScheduler:
                 raw_response=result.get('raw_response', ''),
                 task_complete=bool(result.get('task_complete', False)),
                 spoken_command=str(result.get('spoken_command', '') or '').strip(),
+                predicted_phase=str(result.get('predicted_phase', 'unknown') or 'unknown').strip().lower(),
             )
             
         except Exception as e:
@@ -690,6 +787,17 @@ class StreamingIntentPredictor:
     def set_robot_state(self, state: str):
         """Update robot state description — passed into every inference call"""
         self.scheduler._current_robot_state = state
+
+    def request_immediate_inference(self):
+        """Bypass the polling interval and fire a Qwen inference now.
+
+        Thread-safe. Intended for use from the audio callback when speech
+        onset is detected — drops the worst-case wait from
+        ``inference_interval`` (e.g. 250 ms) to ~0 ms. The trigger is
+        single-shot; subsequent calls before the scheduler consumes it are
+        no-ops.
+        """
+        self.scheduler._immediate_request.set()
     
     def get_latest_prediction(self) -> Optional[PredictionOutput]:
         """Get most recent prediction"""

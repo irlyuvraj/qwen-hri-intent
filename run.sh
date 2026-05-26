@@ -6,17 +6,22 @@
 
 cd "$(dirname "$0")"
 
-EXTRA_ARGS=()
+# Always-on structured metrics (one JSONL line per Qwen prediction).
+TS="$(date +%Y%m%d_%H%M%S)"
+METRICS_FILE="$HOME/sessions/metrics_${TS}.jsonl"
+mkdir -p "$HOME/sessions"
+
+EXTRA_ARGS=(--metrics "$METRICS_FILE")
 for arg in "$@"; do
   if [[ "$arg" == "--record" ]]; then
-    OUTFILE="$HOME/sessions/$(date +%Y%m%d_%H%M%S).mp4"
-    mkdir -p "$HOME/sessions"
+    OUTFILE="$HOME/sessions/${TS}.mp4"
     EXTRA_ARGS+=(--record "$OUTFILE" --record-fps 10)
     echo "Recording to: $OUTFILE"
   else
     EXTRA_ARGS+=("$arg")
   fi
 done
+echo "Metrics  to: $METRICS_FILE"
 
 python run_system_groot.py \
   --vllm-url http://192.168.2.25:8000/v1 \
