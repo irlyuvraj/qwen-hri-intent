@@ -183,15 +183,20 @@ No energy VAD at all. Qwen's `predicted_intent` acts as the voice command detect
 
 ```
 qwen-hri-intent/
-├── run_system_groot.py             # Main entry point: Qwen + GR00T + SO-101
+├── run_system_groot.py             # Main entry point: RobotProfile, PolicyRouter,
+│                                   #   GrootRobotController, grounding + completion gates
 ├── run.sh                          # Shell wrapper (always use this)
 ├── tasks.yaml                      # Task registry (add tasks here, no code change needed)
 ├── task_registry.py                # TaskRegistry: YAML loader + longest-keyword resolver
-├── qwen_inference_engine.py        # FastQwenInferenceEngine: three system prompts
-├── streaming_intent_predictor.py   # StreamingIntentPredictor: 0.5s interval, 1 worker
+├── qwen_inference_engine.py        # FastQwenInferenceEngine: registry-driven prompts,
+│                                   #   grounding + completion verifier calls
+├── streaming_intent_predictor.py   # StreamingIntentPredictor: 0.25s interval, 1 worker
 ├── interrupt_detection_system.py   # InterruptDetectionSystem + AudioInterruptDetector (VAD)
-├── policy_router.py                # PolicyRouter: routes predictions → GR00T controller
 ├── recorder.py                     # SystemRecorder: mp4 + HUD overlay
+├── metrics_logger.py               # MetricsLogger: per-prediction JSONL
+├── eval_metrics.py                 # Offline baseline report over ~/sessions/metrics_*.jsonl
+├── telemetry_publisher.py          # ZMQ telemetry publisher (no-op if disabled)
+├── telemetry_dashboard.py          # Standalone live telemetry dashboard
 ├── interrupt_test_runner.py        # Offline test runner for video files
 ├── file_based_predictor.py         # CLI tool for offline video prediction
 ├── compare_ground_truth.py         # Evaluation against ground truth JSON
@@ -201,8 +206,7 @@ qwen-hri-intent/
     └── cleaning_ground_truth.json
 ```
 
-**Legacy (ACT-based, pre-GR00T):**
-- `run_system.py`, `run_system_act.py` — original 2-PC ACT setup
+(`PolicyRouter` and `GrootRobotController` are classes inside `run_system_groot.py`.)
 
 ---
 
