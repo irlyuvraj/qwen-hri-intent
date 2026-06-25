@@ -1,0 +1,20 @@
+# G1 task registry — monster-tray pick-and-place (GR00T N1.7, Unitree G1).
+#
+# The `lang` strings MUST match the task_description strings the GR00T N1.7
+# checkpoint was trained on, verbatim, or the policy will be off-distribution.
+# Confirmed from the training set meta/tasks.parquet on s99:
+#   task 0: "pick up the green monster can and place it on the tray."
+#   task 1: "pick up the orange monster can and place it on the tray."
+#
+# Everything else (keywords, object) is for the Qwen brain's voice matching
+# and mismatch detection only — identical mechanism to tasks.yaml (SO-101).
+tasks:
+  - name: pick_green_can
+    lang: "pick up the green monster can and place it on the tray."
+    object: "green monster can"
+    keywords: [green, "green can", "green monster", "green one"]
+
+  - name: pick_orange_can
+    lang: "pick up the orange monster can and place it on the tray."
+    object: "orange monster can"
+    keywords: [orange, "orange can", "orange monster", "orange one"]
