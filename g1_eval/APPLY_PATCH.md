@@ -1,5 +1,12 @@
 # Applying the HRI gate to Unitree's `eval_g1_isaac_gr00t.py`
 
+> **Don't need to hand-edit?** If your Unitree checkout is the same
+> `g1_imimtation_learning` version this was built against, skip the edits below
+> and just use the ready-made `g1_eval/eval_g1_isaac_gr00t.py` (drop-in). See
+> `g1_eval/README.md` → "A. Drop-in". Use the manual edits below only when your
+> Unitree copy differs.
+
+
 The G1 runner is Unitree's repo (with NVIDIA/Unitree submodules) — not re-hosted
 here. To reproduce the integration on a fresh clone:
 
