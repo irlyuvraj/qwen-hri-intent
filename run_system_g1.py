@@ -42,6 +42,7 @@ import time
 from typing import Optional
 
 import numpy as np
+import cv2
 
 from qwen_inference_engine import FastQwenInferenceEngine
 from streaming_intent_predictor import StreamingIntentPredictor, StreamConfig
@@ -63,6 +64,24 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("run_g1")
+
+
+def _show_avatar_view(frame, state, policy, hud, age):
+    """Remote 'see-through-the-robot' window: the G1 head-cam frame the brain
+    already receives over ZMQ, with a small status bar. Lets the operator
+    perceive remotely while issuing voice intent (avatar loop)."""
+    disp = frame.copy()
+    h, w = disp.shape[:2]
+    bar = disp.copy()
+    cv2.rectangle(bar, (0, 0), (w, 28), (0, 0, 0), -1)
+    cv2.addWeighted(bar, 0.5, disp, 0.5, 0, disp)
+    cv2.putText(disp, f"{state}:{policy or '-'}  |  {hud}", (8, 19),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    if age > 1.0:  # frames stopped arriving — warn the operator
+        cv2.putText(disp, "STALE FEED", (w - 135, 19),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.imshow("G1 avatar view (head cam)", disp)
+    cv2.waitKey(1)
 
 
 def run(args):
@@ -241,6 +260,7 @@ def run(args):
     last_frame_time = 0.0
     frame_interval = 0.1
     _warned_no_frames = False
+    _hud = "waiting"
     _qwen_seq = 0
     _qwen_last_t = 0.0
     _qwen_hz = 0.0
@@ -267,6 +287,9 @@ def run(args):
                 frame = link.latest_frame()  # BGR np, cam_head (no crop — Qwen-only)
                 if frame is not None:
                     predictor.add_frame(frame)
+                    if args.view:
+                        _show_avatar_view(frame, robot.state,
+                                          robot.active_policy, _hud, link.frame_age())
                 last_frame_time = now
 
             for pred in predictor.get_all_predictions():
@@ -279,6 +302,7 @@ def run(args):
                 _qwen_last_t = _np
                 _spoken = (getattr(pred, "spoken_command", "") or "").strip()
                 _phase = (getattr(pred, "predicted_phase", "") or "unknown").strip()
+                _hud = f"{pred.predicted_intent}/{_phase} {pred.confidence:.0%}"
                 log.info("Qwen #%d: %s/%s(%s) conf=%.2f task_complete=%s spoken='%s' why=%s",
                          _qwen_seq, pred.predicted_intent, _phase,
                          pred.target_object or "-", pred.confidence,
@@ -308,6 +332,8 @@ def run(args):
             time.sleep(0.05)
     finally:
         log.info("Shutting down ...")
+        if args.view:
+            cv2.destroyAllWindows()
         predictor.stop()
         if audio_stream:
             audio_stream.stop()
@@ -342,6 +368,10 @@ def main():
     p.add_argument("--metrics", default=None)
     p.add_argument("--telemetry-port", type=int, default=None)
     p.add_argument("--hpf", action="store_true")
+    p.add_argument("--view", action="store_true",
+                   help="Show the G1 head-cam feed in a window (remote avatar "
+                        "view): see through the robot while you command it. "
+                        "Needs a GUI opencv (opencv-python, not -headless).")
     run(p.parse_args())
 
 
