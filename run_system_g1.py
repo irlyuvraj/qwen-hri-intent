@@ -49,6 +49,7 @@ from streaming_intent_predictor import StreamingIntentPredictor, StreamConfig
 from interrupt_detection_system import InterruptDetectionSystem, connect_to_predictor
 from task_registry import TaskRegistry
 from metrics_logger import MetricsLogger
+from recorder import SystemRecorder
 import telemetry_publisher as telemetry
 
 # Reuse the brain unchanged from the SO-101 entry point. Import-time this pulls
@@ -170,6 +171,25 @@ def run(args):
     if args.telemetry_port:
         telemetry.init(port=args.telemetry_port)
 
+    # ── Recorder (optional) — same SystemRecorder as SO-101: MJPG video +
+    #    side-car WAV of the mic, muxed to MP4 via ffmpeg at stop(). Records the
+    #    cam_head POV with the intent/phase/reason HUD overlay. Needs ffmpeg on
+    #    PATH for the audio track (video-only file kept otherwise). ──────────
+    recorder: Optional[SystemRecorder] = None
+    if args.record:
+        try:
+            recorder = SystemRecorder(output_path=args.record, fps=args.record_fps)
+            recorder.start()
+            interrupt_system.on_interrupt(
+                lambda ev: recorder.push_log(
+                    f"[STOP] {ev.reason.value} conf={ev.confidence:.2f}"))
+            interrupt_system.command_interface.on_new_task(
+                lambda task: recorder.push_log(f"[HEARD] {task}"))
+            log.info("Recording → %s (video+audio via ffmpeg)", args.record)
+        except Exception as e:
+            log.error("Failed to start recorder: %s — continuing without it", e)
+            recorder = None
+
     # ── Audio (local mic on the brain host) — faithful port of the SO-101
     #    audio_callback: energy gate + speech-burst accumulator + fast lane. ─
     audio_stream = None
@@ -235,6 +255,8 @@ def run(args):
                         state["log_t"] = now
                 if not args.no_vad:
                     interrupt_system.on_audio(audio)
+                if recorder is not None:
+                    recorder.push_audio(audio)
 
             audio_stream = sd.InputStream(
                 samplerate=16000, channels=1, blocksize=1600,
@@ -261,6 +283,8 @@ def run(args):
     frame_interval = 0.1
     _warned_no_frames = False
     _hud = "waiting"
+    _last_pred_obj = None      # latest good PredictionOutput for the HUD overlay
+    _last_robot_state = None
     _qwen_seq = 0
     _qwen_last_t = 0.0
     _qwen_hz = 0.0
@@ -290,7 +314,16 @@ def run(args):
                     if args.view:
                         _show_avatar_view(frame, robot.state,
                                           robot.active_policy, _hud, link.frame_age())
+                    if recorder is not None:
+                        recorder.push_frame(frame, _last_pred_obj)
                 last_frame_time = now
+
+            if recorder is not None:
+                rs = f"{robot.state}:{robot.active_policy or 'idle'}"
+                if rs != _last_robot_state:
+                    recorder.push_log(
+                        f"[robot] {robot.state} | policy={robot.active_policy or 'none'}")
+                    _last_robot_state = rs
 
             for pred in predictor.get_all_predictions():
                 _qwen_seq += 1
@@ -303,6 +336,10 @@ def run(args):
                 _spoken = (getattr(pred, "spoken_command", "") or "").strip()
                 _phase = (getattr(pred, "predicted_phase", "") or "unknown").strip()
                 _hud = f"{pred.predicted_intent}/{_phase} {pred.confidence:.0%}"
+                # Keep the last good prediction for the recorder/view HUD (don't
+                # let an 'unknown' parse-failure blank the overlay).
+                if pred.predicted_intent and pred.predicted_intent != "unknown":
+                    _last_pred_obj = pred
                 log.info("Qwen #%d: %s/%s(%s) conf=%.2f task_complete=%s spoken='%s' why=%s",
                          _qwen_seq, pred.predicted_intent, _phase,
                          pred.target_object or "-", pred.confidence,
@@ -328,6 +365,8 @@ def run(args):
                     pred=pred, qwen_hz=_qwen_hz, groot_hz=robot.current_hz,
                     robot_state=_qwen_state, active_policy=robot.active_policy,
                 )
+                if recorder is not None:
+                    recorder.push_stats(_qwen_hz, robot.current_hz, _qwen_seq)
 
             time.sleep(0.05)
     finally:
@@ -337,6 +376,8 @@ def run(args):
         predictor.stop()
         if audio_stream:
             audio_stream.stop()
+        if recorder is not None:
+            recorder.stop()   # finalizes MP4 + muxes audio via ffmpeg
         if metrics is not None:
             metrics.close()
         telemetry.close()
@@ -366,6 +407,12 @@ def main():
                    help="Disable return-to-home on completion (informational; the "
                         "bridge still issues 'home' unless this is set).")
     p.add_argument("--metrics", default=None)
+    p.add_argument("--record", default=None,
+                   help="Path to .mp4 — record the cam_head POV + intent/phase HUD "
+                        "overlay, with the mic audio muxed in via ffmpeg (same "
+                        "SystemRecorder as SO-101). Video-only if ffmpeg is absent.")
+    p.add_argument("--record-fps", type=int, default=10,
+                   help="Recording frame rate (default 10, matches the ~10Hz cam feed).")
     p.add_argument("--telemetry-port", type=int, default=None)
     p.add_argument("--hpf", action="store_true")
     p.add_argument("--view", action="store_true",
