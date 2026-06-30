@@ -869,6 +869,7 @@ If no specific object is targeted, use "none".
         self,
         object_name: str,
         video_frame: np.ndarray,
+        completion_check: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Visual completion check: is the pick-and-place task actually DONE?
 
@@ -896,21 +897,32 @@ If no specific object is targeted, use "none".
             frame_b64 = self.encode_image_to_base64(video_frame)
             if not frame_b64:
                 return fail
-            # Focus the model on the BOWL contents, not the gripper. After a
-            # successful place, GR00T loops back and closes the (empty) gripper
-            # on the table — which looks "holding" to Qwen and defeats any
-            # gripper-state criterion. "Is a ball resting inside the bowl" is the
-            # signal that actually defines completion and avoids that trap.
+            # Focus the model on the PLACEMENT TARGET's contents, not the
+            # gripper. After a successful place, GR00T loops back and closes the
+            # (empty) gripper on the table — which looks "holding" to Qwen and
+            # defeats any gripper-state criterion. Asking whether the object is
+            # at its destination is the signal that actually defines completion
+            # and avoids that trap.
+            #
+            # The success condition is per-task (Task.completion_check) so the
+            # right question is asked for THIS task — e.g. "an orange monster
+            # can is resting on the tray". Falls back to the original ball/bowl
+            # question when a task doesn't specify one (keeps older tasks working).
+            success = completion_check or (
+                "a small ball is resting inside the bowl/plate"
+            )
             prompt = (
-                "Look ONLY at the image (there is no audio). A robot was asked "
-                'to pick up a "' + object_name + '" and place it in the '
-                "bowl/plate.\n"
-                "Look SPECIFICALLY at the bowl/plate. Is a small ball now "
-                "resting INSIDE the bowl/plate — already dropped in and released "
-                "(NOT still being carried or held in the gripper above it)?\n"
-                "Answer true only if a ball is clearly sitting inside the "
-                "bowl/plate. If the bowl is empty, or the ball is still being "
-                "carried/lifted, answer false. Ignore exact color.\n"
+                "Look ONLY at the image (there is no audio). A robot arm was "
+                'asked to complete a pick-and-place task with a "' + object_name
+                + '".\n'
+                "SUCCESS means: " + success + ".\n"
+                "Look SPECIFICALLY at the placement target. Is the success "
+                "condition TRUE right now — the object already placed and "
+                "RELEASED (NOT still being carried, lifted, or held in the "
+                "gripper above the target)?\n"
+                "Answer true only if (" + success + ") is clearly visible. If "
+                "the target is empty, or the object is still being "
+                "carried/held, answer false. Ignore exact color.\n"
                 "Reply with JSON only:\n"
                 '{"complete": true or false, "confidence": 0.0-1.0, '
                 '"reason": "<8 words>"}\n'

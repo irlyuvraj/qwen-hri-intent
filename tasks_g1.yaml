@@ -13,8 +13,13 @@ tasks:
     lang: "pick up the green monster can and place it on the tray."
     object: "green monster can"
     keywords: [green, "green can", "green monster", "green one"]
+    # Visual completion criterion for THIS task — asked as a focused yes/no
+    # question by the completion verifier. Must describe the success state of
+    # the can+tray scene (NOT the default ball+bowl).
+    completion_check: "a green monster can is resting on the tray"
 
   - name: pick_orange_can
     lang: "pick up the orange monster can and place it on the tray."
     object: "orange monster can"
     keywords: [orange, "orange can", "orange monster", "orange one"]
+    completion_check: "an orange monster can is resting on the tray"

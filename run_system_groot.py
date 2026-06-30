@@ -1002,7 +1002,8 @@ class PolicyRouter:
             _ct = self.robot.tasks.get(self.active_policy) if self.active_policy else None
             _frame, _ = self._predictor.frame_buffer.get_latest()
             if _ct is not None and _frame is not None:
-                c = self._engine.verify_task_complete(_ct.object, _frame)
+                c = self._engine.verify_task_complete(
+                    _ct.object, _frame, completion_check=_ct.completion_check)
                 if c.get("grounded"):
                     log.info("Completion check: complete=%s conf=%.2f why=%s",
                              c["complete"], c["confidence"], c.get("reason", ""))
